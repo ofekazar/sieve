@@ -10,7 +10,7 @@ import (
 	"github.com/nsf/termbox-go"
 )
 
-type SimpleViewer struct {
+type Viewer struct {
 	lines   []string // All lines from the file
 	topLine int      // Index of the line at the top of the screen
 	leftCol int      // Horizontal scroll offset
@@ -20,7 +20,7 @@ type SimpleViewer struct {
 
 // ViewerStack manages a stack of viewers for filtering navigation
 type ViewerStack struct {
-	viewers []*SimpleViewer
+	viewers []*Viewer
 }
 
 // App holds the application state
@@ -113,7 +113,7 @@ func (s *SearchState) Search(lines []string, query string, startLine int) int {
 	return -1
 }
 
-func NewSimpleViewer(filename string) (*SimpleViewer, error) {
+func NewViewer(filename string) (*Viewer, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -134,23 +134,23 @@ func NewSimpleViewer(filename string) (*SimpleViewer, error) {
 		return nil, err
 	}
 
-	return &SimpleViewer{
+	return &Viewer{
 		lines:   lines,
 		topLine: 0,
 		leftCol: 0,
 	}, nil
 }
 
-// NewSimpleViewerFromLines creates a SimpleViewer from an existing slice of lines
-func NewSimpleViewerFromLines(lines []string) *SimpleViewer {
-	return &SimpleViewer{
+// NewViewerFromLines creates a Viewer from an existing slice of lines
+func NewViewerFromLines(lines []string) *Viewer {
+	return &Viewer{
 		lines:   lines,
 		topLine: 0,
 		leftCol: 0,
 	}
 }
 
-func (v *SimpleViewer) draw() {
+func (v *Viewer) draw() {
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
 	// Draw visible lines
@@ -189,11 +189,11 @@ func (v *SimpleViewer) draw() {
 	termbox.Flush()
 }
 
-func (v *SimpleViewer) drawStatusBar() {
+func (v *Viewer) drawStatusBar() {
 	v.drawStatusBarWithDepth(1)
 }
 
-func (v *SimpleViewer) drawStatusBarWithDepth(depth int) {
+func (v *Viewer) drawStatusBarWithDepth(depth int) {
 	statusY := v.height
 	var status string
 	if depth > 1 {
@@ -218,7 +218,7 @@ func (v *SimpleViewer) drawStatusBarWithDepth(depth int) {
 }
 
 // showMessage displays a message on the status bar
-func (v *SimpleViewer) showMessage(msg string) {
+func (v *Viewer) showMessage(msg string) {
 	statusY := v.height
 
 	// Clear the status line first
@@ -235,13 +235,13 @@ func (v *SimpleViewer) showMessage(msg string) {
 	termbox.Flush()
 }
 
-func (v *SimpleViewer) navigateUp() {
+func (v *Viewer) navigateUp() {
 	if v.topLine > 0 {
 		v.topLine--
 	}
 }
 
-func (v *SimpleViewer) navigateDown() {
+func (v *Viewer) navigateDown() {
 	maxTop := len(v.lines) - 2
 	if maxTop < 0 {
 		maxTop = 0
@@ -251,7 +251,7 @@ func (v *SimpleViewer) navigateDown() {
 	}
 }
 
-func (v *SimpleViewer) navigateLeft(amount int) {
+func (v *Viewer) navigateLeft(amount int) {
 	newValue := v.leftCol - amount
 	if newValue < 0 {
 		newValue = 0
@@ -259,11 +259,11 @@ func (v *SimpleViewer) navigateLeft(amount int) {
 	v.leftCol = newValue
 }
 
-func (v *SimpleViewer) navigateRight(amount int) {
+func (v *Viewer) navigateRight(amount int) {
 	v.leftCol += amount
 }
 
-func (v *SimpleViewer) pageDown() {
+func (v *Viewer) pageDown() {
 	v.topLine += v.height
 	// Allow scrolling until last line is at top
 	maxTop := len(v.lines) - 2
@@ -275,18 +275,18 @@ func (v *SimpleViewer) pageDown() {
 	}
 }
 
-func (v *SimpleViewer) pageUp() {
+func (v *Viewer) pageUp() {
 	v.topLine -= v.height
 	if v.topLine < 0 {
 		v.topLine = 0
 	}
 }
 
-func (v *SimpleViewer) goToStart() {
+func (v *Viewer) goToStart() {
 	v.topLine = 0
 }
 
-func (v *SimpleViewer) goToEnd() {
+func (v *Viewer) goToEnd() {
 	// Go to last line at top
 	v.topLine = len(v.lines) - 2
 	if v.topLine < 0 {
@@ -294,13 +294,13 @@ func (v *SimpleViewer) goToEnd() {
 	}
 }
 
-func (v *SimpleViewer) resize(width, height int) {
+func (v *Viewer) resize(width, height int) {
 	v.width = width
 	v.height = height - 1 // Reserve one line for status bar
 }
 
 // promptForInput shows a prompt at the bottom line and collects user input
-func (v *SimpleViewer) promptForInput(prompt string) (string, bool) {
+func (v *Viewer) promptForInput(prompt string) (string, bool) {
 	input := ""
 
 	for {
@@ -356,7 +356,7 @@ func (v *SimpleViewer) promptForInput(prompt string) (string, bool) {
 }
 
 // filterLines returns all lines containing the query string
-func (v *SimpleViewer) filterLines(query string) []string {
+func (v *Viewer) filterLines(query string) []string {
 	var filtered []string
 	for _, line := range v.lines {
 		if strings.Contains(line, query) {
@@ -367,7 +367,7 @@ func (v *SimpleViewer) filterLines(query string) []string {
 }
 
 // excludeLines returns all lines NOT containing the query string
-func (v *SimpleViewer) excludeLines(query string) []string {
+func (v *Viewer) excludeLines(query string) []string {
 	var filtered []string
 	for _, line := range v.lines {
 		if !strings.Contains(line, query) {
@@ -378,19 +378,19 @@ func (v *SimpleViewer) excludeLines(query string) []string {
 }
 
 // NewViewerStack creates a new ViewerStack with the initial viewer
-func NewViewerStack(initial *SimpleViewer) *ViewerStack {
+func NewViewerStack(initial *Viewer) *ViewerStack {
 	return &ViewerStack{
-		viewers: []*SimpleViewer{initial},
+		viewers: []*Viewer{initial},
 	}
 }
 
 // Current returns the current (top) viewer
-func (s *ViewerStack) Current() *SimpleViewer {
+func (s *ViewerStack) Current() *Viewer {
 	return s.viewers[len(s.viewers)-1]
 }
 
 // Push adds a new viewer to the stack
-func (s *ViewerStack) Push(v *SimpleViewer) {
+func (s *ViewerStack) Push(v *Viewer) {
 	s.viewers = append(s.viewers, v)
 }
 
@@ -418,12 +418,12 @@ func (s *ViewerStack) Depth() int {
 }
 
 // First returns the first (original) viewer in the stack
-func (s *ViewerStack) First() *SimpleViewer {
+func (s *ViewerStack) First() *Viewer {
 	return s.viewers[0]
 }
 
 // NewApp creates a new App with the given viewer
-func NewApp(viewer *SimpleViewer) *App {
+func NewApp(viewer *Viewer) *App {
 	return &App{
 		stack:  NewViewerStack(viewer),
 		search: &SearchState{},
@@ -431,7 +431,7 @@ func NewApp(viewer *SimpleViewer) *App {
 }
 
 // Current returns the current viewer
-func (a *App) Current() *SimpleViewer {
+func (a *App) Current() *Viewer {
 	return a.stack.Current()
 }
 
@@ -457,7 +457,7 @@ func (a *App) HandleFilterKeep() {
 	if ok && query != "" {
 		filtered := current.filterLines(query)
 		if len(filtered) > 0 {
-			a.stack.Push(NewSimpleViewerFromLines(filtered))
+			a.stack.Push(NewViewerFromLines(filtered))
 			a.search.Clear()
 		}
 	}
@@ -470,7 +470,7 @@ func (a *App) HandleFilterExclude() {
 	if ok && query != "" {
 		filtered := current.excludeLines(query)
 		if len(filtered) > 0 {
-			a.stack.Push(NewSimpleViewerFromLines(filtered))
+			a.stack.Push(NewViewerFromLines(filtered))
 			a.search.Clear()
 		}
 	}
@@ -499,7 +499,7 @@ func (a *App) HandleFilterAppend() {
 		}
 
 		if len(combined) > 0 {
-			a.stack.Push(NewSimpleViewerFromLines(combined))
+			a.stack.Push(NewViewerFromLines(combined))
 			a.search.Clear()
 		}
 	}
@@ -589,7 +589,7 @@ func (a *App) Draw() {
 	}
 }
 
-func (v *SimpleViewer) run() error {
+func (v *Viewer) run() error {
 	fmt.Print("\033[?1049h\033[H")
 	defer fmt.Print("\033[?1049l")
 
@@ -690,7 +690,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	viewer, err := NewSimpleViewer(os.Args[1])
+	viewer, err := NewViewer(os.Args[1])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
 		os.Exit(1)
