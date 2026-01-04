@@ -84,8 +84,8 @@ func (s *SearchState) Prev() int {
 	return s.matches[s.current]
 }
 
-// Search performs a search and returns the first match line index or -1
-func (s *SearchState) Search(lines []string, query string) int {
+// Search performs a search starting from startLine and returns the first match line index or -1
+func (s *SearchState) Search(lines []string, query string, startLine int) int {
 	s.query = query
 	s.matches = nil
 	s.current = -1
@@ -96,10 +96,20 @@ func (s *SearchState) Search(lines []string, query string) int {
 		}
 	}
 
-	if len(s.matches) > 0 {
-		s.current = 0
-		return s.matches[0]
+	if len(s.matches) == 0 {
+		return -1
 	}
+
+	// Find the first match at or after startLine
+	for i, lineIdx := range s.matches {
+		if lineIdx >= startLine {
+			s.current = i
+			return s.matches[i]
+		}
+	}
+
+	// No match at or after startLine, return -1 (don't wrap)
+	s.current = len(s.matches) - 1 // Position at last match for 'N' to work
 	return -1
 }
 
@@ -495,13 +505,17 @@ func (a *App) HandleFilterAppend() {
 	}
 }
 
-// HandleSearch performs a search
+// HandleSearch performs a search starting from current line
 func (a *App) HandleSearch() {
 	current := a.Current()
 	query, ok := current.promptForInput("/")
 	if ok && query != "" {
-		if lineIdx := a.search.Search(current.lines, query); lineIdx >= 0 {
+		lineIdx := a.search.Search(current.lines, query, current.topLine)
+		if lineIdx >= 0 {
 			current.topLine = lineIdx
+		} else if a.search.HasResults() {
+			// No match from current position, show EOF
+			a.ShowTempMessage("EOF - no more matches")
 		}
 	}
 }
