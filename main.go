@@ -86,12 +86,13 @@ func (s *SearchState) Prev() int {
 	return s.matches[s.current]
 }
 
-// Search performs a search starting from startLine and returns the first match line index or -1
-func (s *SearchState) Search(lines []string, query string, startLine int) int {
+// Search performs a search starting from startLine, returns the first match line index or -1
+// If backward is true, searches upward; otherwise searches downward
+func (s *SearchState) Search(lines []string, query string, startLine int, backward bool) int {
 	s.query = query
 	s.matches = nil
 	s.current = -1
-	s.backward = false
+	s.backward = backward
 
 	for i, line := range lines {
 		if strings.Contains(line, query) {
@@ -103,46 +104,26 @@ func (s *SearchState) Search(lines []string, query string, startLine int) int {
 		return -1
 	}
 
-	// Find the first match at or after startLine
-	for i, lineIdx := range s.matches {
-		if lineIdx >= startLine {
-			s.current = i
-			return s.matches[i]
+	if backward {
+		// Find the last match at or before startLine
+		for i := len(s.matches) - 1; i >= 0; i-- {
+			if s.matches[i] <= startLine {
+				s.current = i
+				return s.matches[i]
+			}
 		}
-	}
-
-	// No match at or after startLine, return -1 (don't wrap)
-	s.current = len(s.matches) - 1 // Position at last match for 'N' to work
-	return -1
-}
-
-// SearchBackward performs a backward search starting from startLine and returns the first match line index or -1
-func (s *SearchState) SearchBackward(lines []string, query string, startLine int) int {
-	s.query = query
-	s.matches = nil
-	s.current = -1
-	s.backward = true
-
-	for i, line := range lines {
-		if strings.Contains(line, query) {
-			s.matches = append(s.matches, i)
+		s.current = 0
+	} else {
+		// Find the first match at or after startLine
+		for i, lineIdx := range s.matches {
+			if lineIdx >= startLine {
+				s.current = i
+				return s.matches[i]
+			}
 		}
+		s.current = len(s.matches) - 1
 	}
 
-	if len(s.matches) == 0 {
-		return -1
-	}
-
-	// Find the last match at or before startLine (searching backward)
-	for i := len(s.matches) - 1; i >= 0; i-- {
-		if s.matches[i] <= startLine {
-			s.current = i
-			return s.matches[i]
-		}
-	}
-
-	// No match at or before startLine, return -1 (don't wrap)
-	s.current = 0 // Position at first match for 'n' to work
 	return -1
 }
 
@@ -388,22 +369,13 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 	}
 }
 
-// filterLines returns all lines containing the query string
-func (v *Viewer) filterLines(query string) []string {
+// filterLines returns lines based on query match
+// If keep is true, returns lines containing query; if false, returns lines NOT containing query
+func (v *Viewer) filterLines(query string, keep bool) []string {
 	var filtered []string
 	for _, line := range v.lines {
-		if strings.Contains(line, query) {
-			filtered = append(filtered, line)
-		}
-	}
-	return filtered
-}
-
-// excludeLines returns all lines NOT containing the query string
-func (v *Viewer) excludeLines(query string) []string {
-	var filtered []string
-	for _, line := range v.lines {
-		if !strings.Contains(line, query) {
+		matches := strings.Contains(line, query)
+		if matches == keep {
 			filtered = append(filtered, line)
 		}
 	}
@@ -483,58 +455,30 @@ func (a *App) ClearMessage() {
 	a.statusMessage = ""
 }
 
-// HandleFilterKeep filters keeping matching lines
-func (a *App) HandleFilterKeep() {
+// HandleFilter filters lines based on query
+// If keep is true (&), keeps matching lines; if false (-), excludes matching lines
+func (a *App) HandleFilter(keep bool) {
 	current := a.Current()
 	currentTopLine := current.topLine
 
-	query, ok := current.promptForInput("&")
-	if ok && query != "" {
-		filtered := current.filterLines(query)
-		if len(filtered) > 0 {
-			newViewer := NewViewerFromLines(filtered)
-
-			// Find the first matching line at or after currentTopLine
-			// Count how many matching lines appear before it to get new position
-			matchesBefore := 0
-			foundMatch := false
-			for i := 0; i < len(current.lines); i++ {
-				if strings.Contains(current.lines[i], query) {
-					if i >= currentTopLine && !foundMatch {
-						foundMatch = true
-						break
-					}
-					matchesBefore++
-				}
-			}
-
-			if foundMatch {
-				newViewer.topLine = matchesBefore
-			}
-
-			a.stack.Push(newViewer)
-			a.search.Clear()
-		}
+	prompt := "&"
+	if !keep {
+		prompt = "-"
 	}
-}
 
-// HandleFilterExclude filters excluding matching lines
-func (a *App) HandleFilterExclude() {
-	current := a.Current()
-	currentTopLine := current.topLine
-
-	query, ok := current.promptForInput("-")
+	query, ok := current.promptForInput(prompt)
 	if ok && query != "" {
-		filtered := current.excludeLines(query)
+		filtered := current.filterLines(query, keep)
 		if len(filtered) > 0 {
 			newViewer := NewViewerFromLines(filtered)
 
-			// Find the first non-excluded line at or after currentTopLine
-			// Count how many non-excluded lines appear before it to get new position
+			// Find the first remaining line at or after currentTopLine
+			// Count how many remaining lines appear before it to get new position
 			matchesBefore := 0
 			foundMatch := false
 			for i := 0; i < len(current.lines); i++ {
-				if !strings.Contains(current.lines[i], query) {
+				matches := strings.Contains(current.lines[i], query)
+				if matches == keep {
 					if i >= currentTopLine && !foundMatch {
 						foundMatch = true
 						break
@@ -600,117 +544,76 @@ func (a *App) HandleFilterAppend() {
 }
 
 // HandleSearch performs a search starting from current line
-func (a *App) HandleSearch() {
+// If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
+func (a *App) HandleSearch(backward bool) {
 	current := a.Current()
-	query, ok := current.promptForInput("/")
+	prompt := "/"
+	noMatchMsg := "EOF - no more matches"
+	if backward {
+		prompt = "?"
+		noMatchMsg = "BOF - no more matches"
+	}
+
+	query, ok := current.promptForInput(prompt)
 	if ok && query != "" {
-		lineIdx := a.search.Search(current.lines, query, current.topLine)
+		lineIdx := a.search.Search(current.lines, query, current.topLine, backward)
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
-			// No match from current position, show EOF
-			a.ShowTempMessage("EOF - no more matches")
+			a.ShowTempMessage(noMatchMsg)
 		}
 	}
 }
 
-// HandleSearchBackward performs a backward search starting from current line
-func (a *App) HandleSearchBackward() {
-	current := a.Current()
-	query, ok := current.promptForInput("?")
-	if ok && query != "" {
-		lineIdx := a.search.SearchBackward(current.lines, query, current.topLine)
-		if lineIdx >= 0 {
-			current.topLine = lineIdx
-		} else if a.search.HasResults() {
-			// No match from current position, show BOF
-			a.ShowTempMessage("BOF - no more matches")
+// HandleSearchNav navigates search results
+// If reverse is false (n key): continues in search direction
+// If reverse is true (N key): goes opposite to search direction
+func (a *App) HandleSearchNav(reverse bool) {
+	if !a.search.HasResults() {
+		return
+	}
+
+	// Determine if we should go forward (down) or backward (up) in the file
+	goingUp := a.search.backward != reverse
+
+	if goingUp {
+		if a.search.AtStart() {
+			a.ShowTempMessage("BOF")
+		} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
+			a.Current().topLine = lineIdx
+		}
+	} else {
+		if a.search.AtEnd() {
+			a.ShowTempMessage("EOF")
+		} else if lineIdx := a.search.Next(); lineIdx >= 0 {
+			a.Current().topLine = lineIdx
 		}
 	}
 }
 
-// HandleSearchNext goes to next search result (respects search direction)
-func (a *App) HandleSearchNext() {
-	if a.search.HasResults() {
-		if a.search.backward {
-			// In backward search mode, 'n' goes up (previous match)
-			if a.search.AtStart() {
-				a.ShowTempMessage("BOF")
-			} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
-				a.Current().topLine = lineIdx
-			}
-		} else {
-			// In forward search mode, 'n' goes down (next match)
-			if a.search.AtEnd() {
-				a.ShowTempMessage("EOF")
-			} else if lineIdx := a.search.Next(); lineIdx >= 0 {
-				a.Current().topLine = lineIdx
-			}
-		}
-	}
-}
-
-// HandleSearchPrev goes to previous search result (respects search direction)
-func (a *App) HandleSearchPrev() {
-	if a.search.HasResults() {
-		if a.search.backward {
-			// In backward search mode, 'N' goes down (next match)
-			if a.search.AtEnd() {
-				a.ShowTempMessage("EOF")
-			} else if lineIdx := a.search.Next(); lineIdx >= 0 {
-				a.Current().topLine = lineIdx
-			}
-		} else {
-			// In forward search mode, 'N' goes up (previous match)
-			if a.search.AtStart() {
-				a.ShowTempMessage("BOF")
-			} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
-				a.Current().topLine = lineIdx
-			}
-		}
-	}
-}
-
-// HandleReset resets to first viewer
-func (a *App) HandleReset() {
+// HandleStackNav navigates the viewer stack
+// If reset is true (=), resets to first viewer; if false (^U), pops one level
+func (a *App) HandleStackNav(reset bool) {
 	current := a.Current()
 	currentLine := ""
 	if current.topLine < len(current.lines) {
 		currentLine = current.lines[current.topLine]
 	}
 
-	if a.stack.Reset() {
-		// Find this line in the first viewer to stay on the same line
-		if currentLine != "" {
-			first := a.stack.First()
-			for i, line := range first.lines {
-				if line == currentLine {
-					first.topLine = i
-					break
-				}
-			}
-		}
-	}
-	a.search.Clear()
-}
-
-// HandlePop pops current viewer
-func (a *App) HandlePop() {
-	current := a.Current()
-	currentLine := ""
-	if current.topLine < len(current.lines) {
-		currentLine = current.lines[current.topLine]
+	var changed bool
+	if reset {
+		changed = a.stack.Reset()
+	} else {
+		changed = a.stack.Pop()
 	}
 
-	if a.stack.Pop() {
+	if changed && currentLine != "" {
 		// Find this line in the new current viewer to stay on the same line
-		if currentLine != "" {
-			newCurrent := a.Current()
-			for i, line := range newCurrent.lines {
-				if line == currentLine {
-					newCurrent.topLine = i
-					break
-				}
+		newCurrent := a.Current()
+		for i, line := range newCurrent.lines {
+			if line == currentLine {
+				newCurrent.topLine = i
+				break
 			}
 		}
 	}
@@ -791,21 +694,21 @@ func (v *Viewer) run() error {
 				case 'G':
 					current.goToEnd()
 				case '&':
-					app.HandleFilterKeep()
+					app.HandleFilter(true)
 				case '-':
-					app.HandleFilterExclude()
+					app.HandleFilter(false)
 				case '+':
 					app.HandleFilterAppend()
 				case '/':
-					app.HandleSearch()
+					app.HandleSearch(false)
 				case '?':
-					app.HandleSearchBackward()
+					app.HandleSearch(true)
 				case 'n':
-					app.HandleSearchNext()
+					app.HandleSearchNav(false)
 				case 'N':
-					app.HandleSearchPrev()
+					app.HandleSearchNav(true)
 				case '=':
-					app.HandleReset()
+					app.HandleStackNav(true)
 				case '>':
 					current.navigateRight(1)
 				case '<':
@@ -830,7 +733,7 @@ func (v *Viewer) run() error {
 				case termbox.KeyEnd:
 					current.goToEnd()
 				case termbox.KeyCtrlU:
-					app.HandlePop()
+					app.HandleStackNav(false)
 				case termbox.KeyEsc, termbox.KeyCtrlC:
 					return nil
 				}
