@@ -33,9 +33,10 @@ type App struct {
 
 // SearchState holds the current search results
 type SearchState struct {
-	query   string // Current search query
-	matches []int  // Line indices that match
-	current int    // Current match index (-1 if none)
+	query    string // Current search query
+	matches  []int  // Line indices that match
+	current  int    // Current match index (-1 if none)
+	backward bool   // True if last search was backward (?)
 }
 
 // Clear resets the search state
@@ -43,6 +44,7 @@ func (s *SearchState) Clear() {
 	s.query = ""
 	s.matches = nil
 	s.current = -1
+	s.backward = false
 }
 
 // HasResults returns true if there are search results
@@ -89,6 +91,7 @@ func (s *SearchState) Search(lines []string, query string, startLine int) int {
 	s.query = query
 	s.matches = nil
 	s.current = -1
+	s.backward = false
 
 	for i, line := range lines {
 		if strings.Contains(line, query) {
@@ -110,6 +113,36 @@ func (s *SearchState) Search(lines []string, query string, startLine int) int {
 
 	// No match at or after startLine, return -1 (don't wrap)
 	s.current = len(s.matches) - 1 // Position at last match for 'N' to work
+	return -1
+}
+
+// SearchBackward performs a backward search starting from startLine and returns the first match line index or -1
+func (s *SearchState) SearchBackward(lines []string, query string, startLine int) int {
+	s.query = query
+	s.matches = nil
+	s.current = -1
+	s.backward = true
+
+	for i, line := range lines {
+		if strings.Contains(line, query) {
+			s.matches = append(s.matches, i)
+		}
+	}
+
+	if len(s.matches) == 0 {
+		return -1
+	}
+
+	// Find the last match at or before startLine (searching backward)
+	for i := len(s.matches) - 1; i >= 0; i-- {
+		if s.matches[i] <= startLine {
+			s.current = i
+			return s.matches[i]
+		}
+	}
+
+	// No match at or before startLine, return -1 (don't wrap)
+	s.current = 0 // Position at first match for 'n' to work
 	return -1
 }
 
@@ -453,11 +486,33 @@ func (a *App) ClearMessage() {
 // HandleFilterKeep filters keeping matching lines
 func (a *App) HandleFilterKeep() {
 	current := a.Current()
+	currentTopLine := current.topLine
+
 	query, ok := current.promptForInput("&")
 	if ok && query != "" {
 		filtered := current.filterLines(query)
 		if len(filtered) > 0 {
-			a.stack.Push(NewViewerFromLines(filtered))
+			newViewer := NewViewerFromLines(filtered)
+
+			// Find the first matching line at or after currentTopLine
+			// Count how many matching lines appear before it to get new position
+			matchesBefore := 0
+			foundMatch := false
+			for i := 0; i < len(current.lines); i++ {
+				if strings.Contains(current.lines[i], query) {
+					if i >= currentTopLine && !foundMatch {
+						foundMatch = true
+						break
+					}
+					matchesBefore++
+				}
+			}
+
+			if foundMatch {
+				newViewer.topLine = matchesBefore
+			}
+
+			a.stack.Push(newViewer)
 			a.search.Clear()
 		}
 	}
@@ -466,11 +521,33 @@ func (a *App) HandleFilterKeep() {
 // HandleFilterExclude filters excluding matching lines
 func (a *App) HandleFilterExclude() {
 	current := a.Current()
+	currentTopLine := current.topLine
+
 	query, ok := current.promptForInput("-")
 	if ok && query != "" {
 		filtered := current.excludeLines(query)
 		if len(filtered) > 0 {
-			a.stack.Push(NewViewerFromLines(filtered))
+			newViewer := NewViewerFromLines(filtered)
+
+			// Find the first non-excluded line at or after currentTopLine
+			// Count how many non-excluded lines appear before it to get new position
+			matchesBefore := 0
+			foundMatch := false
+			for i := 0; i < len(current.lines); i++ {
+				if !strings.Contains(current.lines[i], query) {
+					if i >= currentTopLine && !foundMatch {
+						foundMatch = true
+						break
+					}
+					matchesBefore++
+				}
+			}
+
+			if foundMatch {
+				newViewer.topLine = matchesBefore
+			}
+
+			a.stack.Push(newViewer)
 			a.search.Clear()
 		}
 	}
@@ -479,6 +556,11 @@ func (a *App) HandleFilterExclude() {
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
 	current := a.Current()
+	currentLine := ""
+	if current.topLine < len(current.lines) {
+		currentLine = current.lines[current.topLine]
+	}
+
 	query, ok := current.promptForInput("+")
 	if ok && query != "" {
 		original := a.stack.First()
@@ -499,7 +581,19 @@ func (a *App) HandleFilterAppend() {
 		}
 
 		if len(combined) > 0 {
-			a.stack.Push(NewViewerFromLines(combined))
+			newViewer := NewViewerFromLines(combined)
+
+			// Find the current line in the combined result to stay on the same line
+			if currentLine != "" {
+				for i, line := range combined {
+					if line == currentLine {
+						newViewer.topLine = i
+						break
+					}
+				}
+			}
+
+			a.stack.Push(newViewer)
 			a.search.Clear()
 		}
 	}
@@ -520,37 +614,106 @@ func (a *App) HandleSearch() {
 	}
 }
 
-// HandleSearchNext goes to next search result
-func (a *App) HandleSearchNext() {
-	if a.search.HasResults() {
-		if a.search.AtEnd() {
-			a.ShowTempMessage("EOF")
-		} else if lineIdx := a.search.Next(); lineIdx >= 0 {
-			a.Current().topLine = lineIdx
+// HandleSearchBackward performs a backward search starting from current line
+func (a *App) HandleSearchBackward() {
+	current := a.Current()
+	query, ok := current.promptForInput("?")
+	if ok && query != "" {
+		lineIdx := a.search.SearchBackward(current.lines, query, current.topLine)
+		if lineIdx >= 0 {
+			current.topLine = lineIdx
+		} else if a.search.HasResults() {
+			// No match from current position, show BOF
+			a.ShowTempMessage("BOF - no more matches")
 		}
 	}
 }
 
-// HandleSearchPrev goes to previous search result
+// HandleSearchNext goes to next search result (respects search direction)
+func (a *App) HandleSearchNext() {
+	if a.search.HasResults() {
+		if a.search.backward {
+			// In backward search mode, 'n' goes up (previous match)
+			if a.search.AtStart() {
+				a.ShowTempMessage("BOF")
+			} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
+				a.Current().topLine = lineIdx
+			}
+		} else {
+			// In forward search mode, 'n' goes down (next match)
+			if a.search.AtEnd() {
+				a.ShowTempMessage("EOF")
+			} else if lineIdx := a.search.Next(); lineIdx >= 0 {
+				a.Current().topLine = lineIdx
+			}
+		}
+	}
+}
+
+// HandleSearchPrev goes to previous search result (respects search direction)
 func (a *App) HandleSearchPrev() {
 	if a.search.HasResults() {
-		if a.search.AtStart() {
-			a.ShowTempMessage("BOF")
-		} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
-			a.Current().topLine = lineIdx
+		if a.search.backward {
+			// In backward search mode, 'N' goes down (next match)
+			if a.search.AtEnd() {
+				a.ShowTempMessage("EOF")
+			} else if lineIdx := a.search.Next(); lineIdx >= 0 {
+				a.Current().topLine = lineIdx
+			}
+		} else {
+			// In forward search mode, 'N' goes up (previous match)
+			if a.search.AtStart() {
+				a.ShowTempMessage("BOF")
+			} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
+				a.Current().topLine = lineIdx
+			}
 		}
 	}
 }
 
 // HandleReset resets to first viewer
 func (a *App) HandleReset() {
-	a.stack.Reset()
+	current := a.Current()
+	currentLine := ""
+	if current.topLine < len(current.lines) {
+		currentLine = current.lines[current.topLine]
+	}
+
+	if a.stack.Reset() {
+		// Find this line in the first viewer to stay on the same line
+		if currentLine != "" {
+			first := a.stack.First()
+			for i, line := range first.lines {
+				if line == currentLine {
+					first.topLine = i
+					break
+				}
+			}
+		}
+	}
 	a.search.Clear()
 }
 
 // HandlePop pops current viewer
 func (a *App) HandlePop() {
-	a.stack.Pop()
+	current := a.Current()
+	currentLine := ""
+	if current.topLine < len(current.lines) {
+		currentLine = current.lines[current.topLine]
+	}
+
+	if a.stack.Pop() {
+		// Find this line in the new current viewer to stay on the same line
+		if currentLine != "" {
+			newCurrent := a.Current()
+			for i, line := range newCurrent.lines {
+				if line == currentLine {
+					newCurrent.topLine = i
+					break
+				}
+			}
+		}
+	}
 	a.search.Clear()
 }
 
@@ -635,6 +798,8 @@ func (v *Viewer) run() error {
 					app.HandleFilterAppend()
 				case '/':
 					app.HandleSearch()
+				case '?':
+					app.HandleSearchBackward()
 				case 'n':
 					app.HandleSearchNext()
 				case 'N':
@@ -686,7 +851,7 @@ func (v *Viewer) run() error {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: simple-viewer <filename>")
+		fmt.Println("Usage: cut <filename>")
 		os.Exit(1)
 	}
 

@@ -1,4 +1,4 @@
-module ofekazarya/view
+module ofekazarya/cut
 
 go 1.23.0
 
