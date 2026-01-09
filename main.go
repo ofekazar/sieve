@@ -417,27 +417,12 @@ func (s *ViewerStack) Reset() bool {
 	return true
 }
 
-// Depth returns the number of viewers in the stack
-func (s *ViewerStack) Depth() int {
-	return len(s.viewers)
-}
-
-// First returns the first (original) viewer in the stack
-func (s *ViewerStack) First() *Viewer {
-	return s.viewers[0]
-}
-
 // NewApp creates a new App with the given viewer
 func NewApp(viewer *Viewer) *App {
 	return &App{
 		stack:  NewViewerStack(viewer),
 		search: &SearchState{},
 	}
-}
-
-// Current returns the current viewer
-func (a *App) Current() *Viewer {
-	return a.stack.Current()
 }
 
 // ShowTempMessage displays a message for 3 seconds
@@ -458,7 +443,7 @@ func (a *App) ClearMessage() {
 // HandleFilter filters lines based on query
 // If keep is true (&), keeps matching lines; if false (-), excludes matching lines
 func (a *App) HandleFilter(keep bool) {
-	current := a.Current()
+	current := a.stack.Current()
 	currentTopLine := current.topLine
 
 	prompt := "&"
@@ -499,7 +484,7 @@ func (a *App) HandleFilter(keep bool) {
 
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
-	current := a.Current()
+	current := a.stack.Current()
 	currentLine := ""
 	if current.topLine < len(current.lines) {
 		currentLine = current.lines[current.topLine]
@@ -507,7 +492,7 @@ func (a *App) HandleFilterAppend() {
 
 	query, ok := current.promptForInput("+")
 	if ok && query != "" {
-		original := a.stack.First()
+		original := a.stack.viewers[0]
 
 		currentCounts := make(map[string]int)
 		for _, line := range current.lines {
@@ -546,7 +531,7 @@ func (a *App) HandleFilterAppend() {
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
-	current := a.Current()
+	current := a.stack.Current()
 	prompt := "/"
 	noMatchMsg := "EOF - no more matches"
 	if backward {
@@ -580,13 +565,13 @@ func (a *App) HandleSearchNav(reverse bool) {
 		if a.search.AtStart() {
 			a.ShowTempMessage("BOF")
 		} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
-			a.Current().topLine = lineIdx
+			a.stack.Current().topLine = lineIdx
 		}
 	} else {
 		if a.search.AtEnd() {
 			a.ShowTempMessage("EOF")
 		} else if lineIdx := a.search.Next(); lineIdx >= 0 {
-			a.Current().topLine = lineIdx
+			a.stack.Current().topLine = lineIdx
 		}
 	}
 }
@@ -594,7 +579,7 @@ func (a *App) HandleSearchNav(reverse bool) {
 // HandleStackNav navigates the viewer stack
 // If reset is true (=), resets to first viewer; if false (^U), pops one level
 func (a *App) HandleStackNav(reset bool) {
-	current := a.Current()
+	current := a.stack.Current()
 	currentLine := ""
 	if current.topLine < len(current.lines) {
 		currentLine = current.lines[current.topLine]
@@ -609,7 +594,7 @@ func (a *App) HandleStackNav(reset bool) {
 
 	if changed && currentLine != "" {
 		// Find this line in the new current viewer to stay on the same line
-		newCurrent := a.Current()
+		newCurrent := a.stack.Current()
 		for i, line := range newCurrent.lines {
 			if line == currentLine {
 				newCurrent.topLine = i
@@ -622,7 +607,7 @@ func (a *App) HandleStackNav(reset bool) {
 
 // Draw renders the current view
 func (a *App) Draw() {
-	current := a.Current()
+	current := a.stack.Current()
 	current.resize(termbox.Size())
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
@@ -650,7 +635,7 @@ func (a *App) Draw() {
 		current.showMessage(a.statusMessage)
 	} else {
 		a.statusMessage = ""
-		current.drawStatusBarWithDepth(a.stack.Depth())
+		current.drawStatusBarWithDepth(len(a.stack.viewers))
 		termbox.Flush()
 	}
 }
@@ -671,7 +656,7 @@ func (v *Viewer) run() error {
 	app.Draw()
 
 	for {
-		current := app.Current()
+		current := app.stack.Current()
 
 		switch ev := termbox.PollEvent(); ev.Type {
 		case termbox.EventKey:
