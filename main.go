@@ -363,6 +363,7 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 				input += " "
 			}
 		case termbox.EventResize:
+			termbox.Sync()
 			v.resize(ev.Width, ev.Height)
 			v.draw()
 		}
@@ -726,6 +727,7 @@ func (v *Viewer) run() error {
 			app.Draw()
 
 		case termbox.EventResize:
+			termbox.Sync()
 			app.Draw()
 
 		case termbox.EventInterrupt:
