@@ -1093,15 +1093,31 @@ func NewApp(viewer *Viewer) *App {
 	}
 }
 
-// promptForFilter prompts for filter input with history navigation (up/down arrows)
-func (a *App) promptForFilter(prompt string) (string, bool) {
+// promptForFilter prompts for filter input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
+// Returns: input string, isRegex flag, ignoreCase flag, ok
+func (a *App) promptForFilter(prompt string) (string, bool, bool, bool) {
 	v := a.stack.Current()
 	a.history.Reset()
 	input := ""
+	isRegex := false
+	ignoreCase := false
 
 	for {
 		statusY := v.height
-		line := prompt + input
+		indicators := ""
+		if isRegex {
+			indicators += "[regex]"
+		}
+		if ignoreCase {
+			if indicators != "" {
+				indicators += " "
+			}
+			indicators += "[nocase]"
+		}
+		if indicators != "" {
+			indicators += " "
+		}
+		line := prompt + indicators + input
 
 		for i := 0; i < v.width; i++ {
 			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
@@ -1126,10 +1142,10 @@ func (a *App) promptForFilter(prompt string) (string, bool) {
 				if input != "" {
 					a.history.Add(input)
 				}
-				return input, true
+				return input, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
 				termbox.HideCursor()
-				return "", false
+				return "", false, false, false
 			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
 				if len(input) > 0 {
 					runes := []rune(input)
@@ -1139,6 +1155,10 @@ func (a *App) promptForFilter(prompt string) (string, bool) {
 				input = a.history.Up(input)
 			} else if ev.Key == termbox.KeyArrowDown {
 				input = a.history.Down(input)
+			} else if ev.Key == termbox.KeyCtrlR {
+				isRegex = !isRegex
+			} else if ev.Key == termbox.KeyCtrlI {
+				ignoreCase = !ignoreCase
 			} else if ev.Ch != 0 {
 				input += string(ev.Ch)
 			} else if ev.Key == termbox.KeySpace {
@@ -1334,9 +1354,33 @@ func (a *App) HandleFilter(keep bool) {
 		prompt = "-"
 	}
 
-	query, ok := a.promptForFilter(prompt)
+	query, isRegex, ignoreCase, ok := a.promptForFilter(prompt)
 	if ok && query != "" {
 		lines := current.GetLines() // Get snapshot for thread-safety
+
+		// Compile matcher based on options
+		var matcher func(string) bool
+		if isRegex {
+			pattern := query
+			if ignoreCase {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				a.ShowTempMessage("Invalid regex: " + err.Error())
+				return
+			}
+			matcher = re.MatchString
+		} else if ignoreCase {
+			queryLower := strings.ToLower(query)
+			matcher = func(line string) bool {
+				return strings.Contains(strings.ToLower(line), queryLower)
+			}
+		} else {
+			matcher = func(line string) bool {
+				return strings.Contains(line, query)
+			}
+		}
 
 		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
@@ -1375,7 +1419,7 @@ func (a *App) HandleFilter(keep bool) {
 					var chunkLines []string
 					var chunkIndices []int
 					for i := start; i < end; i++ {
-						matches := strings.Contains(lines[i], query)
+						matches := matcher(lines[i])
 						if matches == keep {
 							chunkLines = append(chunkLines, lines[i])
 							chunkIndices = append(chunkIndices, i)
@@ -1451,11 +1495,35 @@ func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
 	currentLine := current.GetLine(current.topLine)
 
-	query, ok := a.promptForFilter("+")
+	query, isRegex, ignoreCase, ok := a.promptForFilter("+")
 	if ok && query != "" {
 		original := a.stack.viewers[0]
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
+
+		// Compile matcher based on options
+		var matcher func(string) bool
+		if isRegex {
+			pattern := query
+			if ignoreCase {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				a.ShowTempMessage("Invalid regex: " + err.Error())
+				return
+			}
+			matcher = re.MatchString
+		} else if ignoreCase {
+			queryLower := strings.ToLower(query)
+			matcher = func(line string) bool {
+				return strings.Contains(strings.ToLower(line), queryLower)
+			}
+		} else {
+			matcher = func(line string) bool {
+				return strings.Contains(line, query)
+			}
+		}
 
 		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
@@ -1522,7 +1590,7 @@ func (a *App) HandleFilterAppend() {
 					var chunkLines []string
 					var chunkIndices []int
 					for i := start; i < end; i++ {
-						if inCurrent[i] || strings.Contains(originalLines[i], query) {
+						if inCurrent[i] || matcher(originalLines[i]) {
 							chunkLines = append(chunkLines, originalLines[i])
 							chunkIndices = append(chunkIndices, i)
 						}
