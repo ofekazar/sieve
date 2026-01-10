@@ -1197,7 +1197,7 @@ func (a *App) ShowHelp() {
 			{"-", "Exclude matching"},
 			{"+", "Add from original"},
 			{"=", "Reset to original"},
-			{"^U", "Pop filter"},
+			{"u / ^U", "Pop filter"},
 		}},
 		{"Other", []helpEntry{
 			{"w", "Toggle wrap"},
@@ -2080,6 +2080,8 @@ func (v *Viewer) run() error {
 					app.HandleSearchNav(true)
 				case '=':
 					app.HandleStackNav(true)
+				case 'u':
+					app.HandleStackNav(false)
 				case '>':
 					current.navigateRight(1)
 				case '<':
