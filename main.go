@@ -1600,57 +1600,75 @@ func (a *App) ShowHelp() {
 		entries []helpEntry
 	}{
 		{"Navigation", []helpEntry{
-			{"j / ↓", "Move down"},
-			{"k / ↑", "Move up"},
+			{"j / ↓", "Move down one line"},
+			{"k / ↑", "Move up one line"},
 			{"h / ←", "Scroll left"},
 			{"l / →", "Scroll right"},
-			{"g / Home", "Go to start"},
-			{"G / End", "Go to end"},
-			{"Space", "Page down"},
+			{"< / >", "Scroll left/right by 1 char"},
+			{"g / Home", "Go to first line"},
+			{"G / End", "Go to last line"},
+			{"Space/PgDn", "Page down"},
 			{"PgUp", "Page up"},
-			{":<num>", "Go to line"},
+			{":<number>", "Go to specific line number"},
 		}},
 		{"Search", []helpEntry{
 			{"/", "Search forward"},
 			{"?", "Search backward"},
-			{"n / N", "Next / prev match"},
-			{"^R", "Toggle regex"},
-			{"^I", "Toggle case"},
-			{"t", "Set time format"},
-			{"b", "Jump to time"},
+			{"n", "Next match"},
+			{"N", "Previous match"},
+			{"Ctrl+R", "Toggle regex mode (in prompt)"},
+			{"Ctrl+I", "Toggle case-insensitive (in prompt)"},
 		}},
-		{"Filter", []helpEntry{
-			{"&", "Keep matching"},
-			{"-", "Exclude matching"},
-			{"+", "Add from original"},
-			{"=", "Reset to original"},
-			{"u / ^U", "Pop filter"},
+		{"Timestamp", []helpEntry{
+			{"t", "Set timestamp format (Python style)"},
+			{"b", "Jump to timestamp ([yymmdd]hhmmss)"},
 		}},
-		{"Other", []helpEntry{
-			{"w", "Toggle wrap"},
-			{"f", "Toggle JSON"},
-			{"K", "Sticky left cols"},
-			{"v", "Visual select"},
-			{"y", "Yank selection"},
-			{";", "Export to file"},
-			{"q / Esc", "Quit"},
+		{"Filters", []helpEntry{
+			{"&", "Keep lines matching pattern"},
+			{"-", "Exclude lines matching pattern"},
+			{"+", "Add matching from original file"},
+			{"=", "Reset to original file"},
+			{"u / Ctrl+U", "Pop last filter (go back one level)"},
+		}},
+		{"Display", []helpEntry{
+			{"w", "Toggle word wrap"},
+			{"f", "Toggle JSON pretty-print"},
+			{"F", "Toggle follow mode (tail -f)"},
+			{"K", "Set sticky left columns"},
+		}},
+		{"Selection & Export", []helpEntry{
+			{"v", "Enter visual selection mode"},
+			{"y", "Yank (copy) selected lines"},
+			{";", "Export filtered view to file"},
+			{"Esc", "Exit visual mode / quit"},
+		}},
+		{"Help", []helpEntry{
+			{"H / F1", "Show this help screen"},
+			{"q", "Quit"},
 		}},
 	}
 
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 	width, height := termbox.Size()
 
-	// Calculate box dimensions
-	boxWidth := 56
-	boxHeight := 24
+	// Use nearly full screen with some margin
+	margin := 2
+	boxWidth := width - margin*2
+	boxHeight := height - margin*2
+	if boxWidth < 40 {
+		boxWidth = 40
+	}
+	if boxHeight < 20 {
+		boxHeight = 20
+	}
+	if boxWidth > width {
+		boxWidth = width
+	}
+	if boxHeight > height {
+		boxHeight = height
+	}
 	startX := (width - boxWidth) / 2
 	startY := (height - boxHeight) / 2
-	if startX < 0 {
-		startX = 0
-	}
-	if startY < 0 {
-		startY = 0
-	}
 
 	// Colors
 	borderFg := termbox.ColorCyan
@@ -1677,7 +1695,7 @@ func (a *App) ShowHelp() {
 			termbox.SetCell(x, y+i, '│', borderFg, bgColor)
 			termbox.SetCell(x+w-1, y+i, '│', borderFg, bgColor)
 		}
-		// Fill inside
+		// Fill inside with background
 		for row := 1; row < h-1; row++ {
 			for col := 1; col < w-1; col++ {
 				termbox.SetCell(x+col, y+row, ' ', descFg, bgColor)
@@ -1687,40 +1705,58 @@ func (a *App) ShowHelp() {
 
 	drawText := func(x, y int, text string, fg termbox.Attribute) {
 		for i, ch := range text {
-			termbox.SetCell(x+i, y, ch, fg, bgColor)
+			if x+i < startX+boxWidth-1 {
+				termbox.SetCell(x+i, y, ch, fg, bgColor)
+			}
 		}
 	}
 
 	drawBox(startX, startY, boxWidth, boxHeight)
 
 	// Title
-	title := " CUT - Help "
+	title := fmt.Sprintf(" CUT v%s - Keybindings ", version)
 	titleX := startX + (boxWidth-len(title))/2
 	drawText(titleX, startY, title, titleFg)
 
-	// Draw sections in two columns
-	y := startY + 2
-	col1X := startX + 2
-	col2X := startX + boxWidth/2
+	// Calculate columns
+	colWidth := (boxWidth - 4) / 3
+	if colWidth < 25 {
+		colWidth = (boxWidth - 4) / 2
+	}
 
-	for i, section := range sections {
-		colX := col1X
-		if i >= 2 {
-			colX = col2X
-		}
-		if i == 2 {
+	// Draw sections across columns
+	col := 0
+	y := startY + 2
+	maxY := startY + boxHeight - 3
+
+	for _, section := range sections {
+		colX := startX + 2 + col*colWidth
+
+		// Check if section fits in current column
+		neededRows := 1 + len(section.entries) + 1
+		if y+neededRows > maxY && col < 2 {
+			// Move to next column
+			col++
+			colX = startX + 2 + col*colWidth
 			y = startY + 2
+		}
+
+		if y >= maxY {
+			break // No more room
 		}
 
 		drawText(colX, y, section.title, sectionFg)
 		y++
 
 		for _, entry := range section.entries {
-			drawText(colX, y, fmt.Sprintf("%-10s", entry.key), keyFg)
-			drawText(colX+11, y, entry.desc, descFg)
+			if y >= maxY {
+				break
+			}
+			drawText(colX, y, fmt.Sprintf("%-12s", entry.key), keyFg)
+			drawText(colX+13, y, entry.desc, descFg)
 			y++
 		}
-		y++
+		y++ // Space between sections
 	}
 
 	// Footer
