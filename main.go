@@ -308,32 +308,40 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 	s.matches = nil
 	s.current = -1
 	s.backward = backward
+	s.regex = nil
 
-	// Build the pattern
-	var pattern string
-	if isRegex {
-		pattern = query
+	// Fast path: literal case-sensitive search using strings.Contains
+	if !isRegex && !ignoreCase {
+		for i, line := range lines {
+			if strings.Contains(line, query) {
+				s.matches = append(s.matches, i)
+			}
+		}
+	} else if !isRegex && ignoreCase {
+		// Case-insensitive literal search
+		lowerQuery := strings.ToLower(query)
+		for i, line := range lines {
+			if strings.Contains(strings.ToLower(line), lowerQuery) {
+				s.matches = append(s.matches, i)
+			}
+		}
 	} else {
-		// Literal string search - escape regex metacharacters
-		pattern = regexp.QuoteMeta(query)
-	}
+		// Regex search
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			// Invalid regex, treat as literal
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+		s.regex = re
 
-	// Add case-insensitive flag if needed
-	if ignoreCase {
-		pattern = "(?i)" + pattern
-	}
-
-	// Compile regex pattern
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		// Invalid regex, treat as literal
-		re = regexp.MustCompile(regexp.QuoteMeta(query))
-	}
-	s.regex = re
-
-	for i, line := range lines {
-		if s.regex.MatchString(line) {
-			s.matches = append(s.matches, i)
+		for i, line := range lines {
+			if s.regex.MatchString(line) {
+				s.matches = append(s.matches, i)
+			}
 		}
 	}
 
@@ -1399,7 +1407,7 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 
 // getMatchPositions returns search match positions for highlighting
 func (a *App) getMatchPositions(cells []ansiCell) []bool {
-	if a.search.regex == nil {
+	if a.search.query == "" {
 		return nil
 	}
 
@@ -1410,12 +1418,50 @@ func (a *App) getMatchPositions(cells []ansiCell) []bool {
 	}
 	plainStr := string(plainText)
 
-	matches := a.search.regex.FindAllStringIndex(plainStr, -1)
-	for _, match := range matches {
-		startRune := len([]rune(plainStr[:match[0]]))
-		endRune := len([]rune(plainStr[:match[1]]))
-		for j := startRune; j < endRune && j < len(matchPositions); j++ {
-			matchPositions[j] = true
+	if a.search.regex != nil {
+		// Regex search - use regex for highlighting
+		matches := a.search.regex.FindAllStringIndex(plainStr, -1)
+		for _, match := range matches {
+			startRune := len([]rune(plainStr[:match[0]]))
+			endRune := len([]rune(plainStr[:match[1]]))
+			for j := startRune; j < endRune && j < len(matchPositions); j++ {
+				matchPositions[j] = true
+			}
+		}
+	} else if a.search.ignoreCase {
+		// Case-insensitive literal search
+		lowerStr := strings.ToLower(plainStr)
+		lowerQuery := strings.ToLower(a.search.query)
+		queryLen := len([]rune(lowerQuery))
+		idx := 0
+		for {
+			pos := strings.Index(lowerStr[idx:], lowerQuery)
+			if pos == -1 {
+				break
+			}
+			// Convert byte position to rune position
+			runePos := len([]rune(lowerStr[:idx+pos]))
+			for j := runePos; j < runePos+queryLen && j < len(matchPositions); j++ {
+				matchPositions[j] = true
+			}
+			idx += pos + 1
+		}
+	} else {
+		// Case-sensitive literal search - use strings.Index
+		query := a.search.query
+		queryLen := len([]rune(query))
+		idx := 0
+		for {
+			pos := strings.Index(plainStr[idx:], query)
+			if pos == -1 {
+				break
+			}
+			// Convert byte position to rune position
+			runePos := len([]rune(plainStr[:idx+pos]))
+			for j := runePos; j < runePos+queryLen && j < len(matchPositions); j++ {
+				matchPositions[j] = true
+			}
+			idx += pos + 1
 		}
 	}
 	return matchPositions
