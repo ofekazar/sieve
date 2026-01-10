@@ -152,12 +152,13 @@ type App struct {
 
 // SearchState holds the current search results
 type SearchState struct {
-	query    string         // Current search query
-	regex    *regexp.Regexp // Compiled regex pattern
-	isRegex  bool           // True if regex mode is enabled
-	matches  []int          // Line indices that match
-	current  int            // Current match index (-1 if none)
-	backward bool           // True if last search was backward (?)
+	query      string         // Current search query
+	regex      *regexp.Regexp // Compiled regex pattern
+	isRegex    bool           // True if regex mode is enabled
+	ignoreCase bool           // True if case-insensitive search
+	matches    []int          // Line indices that match
+	current    int            // Current match index (-1 if none)
+	backward   bool           // True if last search was backward (?)
 }
 
 // Clear resets the search state
@@ -165,6 +166,7 @@ func (s *SearchState) Clear() {
 	s.query = ""
 	s.regex = nil
 	s.isRegex = false
+	s.ignoreCase = false
 	s.matches = nil
 	s.current = -1
 	s.backward = false
@@ -211,24 +213,32 @@ func (s *SearchState) Prev() int {
 
 // Search performs a search starting from startLine, returns the first match line index or -1
 // If backward is true, searches upward; otherwise searches downward
-func (s *SearchState) Search(lines []string, query string, startLine int, backward bool, isRegex bool) int {
+func (s *SearchState) Search(lines []string, query string, startLine int, backward bool, isRegex bool, ignoreCase bool) int {
 	s.query = query
 	s.isRegex = isRegex
+	s.ignoreCase = ignoreCase
 	s.matches = nil
 	s.current = -1
 	s.backward = backward
 
-	// Compile regex pattern
-	var re *regexp.Regexp
+	// Build the pattern
+	var pattern string
 	if isRegex {
-		var err error
-		re, err = regexp.Compile(query)
-		if err != nil {
-			// Invalid regex, treat as literal
-			re = regexp.MustCompile(regexp.QuoteMeta(query))
-		}
+		pattern = query
 	} else {
 		// Literal string search - escape regex metacharacters
+		pattern = regexp.QuoteMeta(query)
+	}
+
+	// Add case-insensitive flag if needed
+	if ignoreCase {
+		pattern = "(?i)" + pattern
+	}
+
+	// Compile regex pattern
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		// Invalid regex, treat as literal
 		re = regexp.MustCompile(regexp.QuoteMeta(query))
 	}
 	s.regex = re
@@ -509,24 +519,78 @@ func (v *Viewer) resize(width, height int) {
 
 // promptForInput shows a prompt at the bottom line and collects user input
 func (v *Viewer) promptForInput(prompt string) (string, bool) {
-	input, _, ok := v.promptForInputWithRegex(prompt, false)
-	return input, ok
+	input := ""
+
+	for {
+		statusY := v.height
+		line := prompt + input
+
+		for i := 0; i < v.width; i++ {
+			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+		}
+		for i, char := range line {
+			if i >= v.width {
+				break
+			}
+			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+		}
+		cursorPos := len([]rune(line))
+		if cursorPos < v.width {
+			termbox.SetCursor(cursorPos, statusY)
+		}
+		termbox.Flush()
+
+		ev := termbox.PollEvent()
+		switch ev.Type {
+		case termbox.EventKey:
+			if ev.Key == termbox.KeyEnter {
+				termbox.HideCursor()
+				return input, true
+			} else if ev.Key == termbox.KeyEsc {
+				termbox.HideCursor()
+				return "", false
+			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
+				if len(input) > 0 {
+					runes := []rune(input)
+					input = string(runes[:len(runes)-1])
+				}
+			} else if ev.Ch != 0 {
+				input += string(ev.Ch)
+			} else if ev.Key == termbox.KeySpace {
+				input += " "
+			}
+		case termbox.EventResize:
+			termbox.Sync()
+			v.resize(ev.Width, ev.Height)
+			v.draw()
+		}
+	}
 }
 
-// promptForInputWithRegex prompts for input with optional regex toggle (Ctrl+R)
-// Returns: input string, isRegex flag, ok
-func (v *Viewer) promptForInputWithRegex(prompt string, allowRegexToggle bool) (string, bool, bool) {
+// promptForSearch prompts for search input with regex (Ctrl+R) and case (Ctrl+I) toggles
+// Returns: input string, isRegex flag, ignoreCase flag, ok
+func (v *Viewer) promptForSearch(prompt string) (string, bool, bool, bool) {
 	input := ""
 	isRegex := false
+	ignoreCase := false
 
 	for {
 		// Draw the prompt line at the bottom
 		statusY := v.height
-		regexIndicator := ""
-		if allowRegexToggle && isRegex {
-			regexIndicator = "[regex] "
+		indicators := ""
+		if isRegex {
+			indicators += "[regex]"
 		}
-		line := prompt + regexIndicator + input
+		if ignoreCase {
+			if indicators != "" {
+				indicators += " "
+			}
+			indicators += "[nocase]"
+		}
+		if indicators != "" {
+			indicators += " "
+		}
+		line := prompt + indicators + input
 
 		// Clear the status line first
 		for i := 0; i < v.width; i++ {
@@ -554,17 +618,19 @@ func (v *Viewer) promptForInputWithRegex(prompt string, allowRegexToggle bool) (
 		case termbox.EventKey:
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
-				return input, isRegex, true
+				return input, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
 				termbox.HideCursor()
-				return "", false, false
+				return "", false, false, false
 			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
 				if len(input) > 0 {
 					runes := []rune(input)
 					input = string(runes[:len(runes)-1])
 				}
-			} else if ev.Key == termbox.KeyCtrlR && allowRegexToggle {
+			} else if ev.Key == termbox.KeyCtrlR {
 				isRegex = !isRegex
+			} else if ev.Key == termbox.KeyCtrlI {
+				ignoreCase = !ignoreCase
 			} else if ev.Ch != 0 {
 				input += string(ev.Ch)
 			} else if ev.Key == termbox.KeySpace {
@@ -932,10 +998,10 @@ func (a *App) HandleSearch(backward bool) {
 		noMatchMsg = "BOF - no more matches"
 	}
 
-	query, isRegex, ok := current.promptForInputWithRegex(prompt, true)
+	query, isRegex, ignoreCase, ok := current.promptForSearch(prompt)
 	if ok && query != "" {
 		lines := current.GetLines()
-		lineIdx := a.search.Search(lines, query, current.topLine, backward, isRegex)
+		lineIdx := a.search.Search(lines, query, current.topLine, backward, isRegex, ignoreCase)
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
