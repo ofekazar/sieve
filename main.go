@@ -145,6 +145,62 @@ func findJSONStart(line string) int {
 	return -1
 }
 
+// findJSONEnd finds the matching closing brace/bracket starting from jsonStart
+// Returns the index of the closing character, or -1 if not found
+func findJSONEnd(line string, jsonStart int) int {
+	if jsonStart < 0 || jsonStart >= len(line) {
+		return -1
+	}
+
+	openChar := line[jsonStart]
+	var closeChar byte
+	if openChar == '{' {
+		closeChar = '}'
+	} else if openChar == '[' {
+		closeChar = ']'
+	} else {
+		return -1
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+
+	for i := jsonStart; i < len(line); i++ {
+		c := line[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if c == '\\' && inString {
+			escaped = true
+			continue
+		}
+
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+
+		if inString {
+			continue
+		}
+
+		if c == openChar {
+			depth++
+		} else if c == closeChar {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+
+	return -1
+}
+
 // stripANSIForJSON removes ANSI escape codes from a string for JSON parsing
 func stripANSIForJSON(s string) string {
 	var result strings.Builder
@@ -205,24 +261,34 @@ func formatJSON(line string) []string {
 		return []string{line}
 	}
 
+	jsonEnd := findJSONEnd(line, jsonStart)
+	if jsonEnd == -1 {
+		// No matching close, try the whole rest of line
+		jsonEnd = len(line) - 1
+	}
+
 	prefix := line[:jsonStart]
-	jsonPart := line[jsonStart:]
+	jsonPart := line[jsonStart : jsonEnd+1]
+	suffix := ""
+	if jsonEnd+1 < len(line) {
+		suffix = line[jsonEnd+1:]
+	}
 
 	// Try as-is first (valid JSON)
 	var out bytes.Buffer
-	err := json.Indent(&out, []byte(jsonPart), "  ", "  ")
+	err := json.Indent(&out, []byte(jsonPart), "", "  ")
 	if err != nil {
 		// Try converting from Python dict syntax
 		converted := pythonToJSON(jsonPart)
 		out.Reset()
-		err = json.Indent(&out, []byte(converted), "  ", "  ")
+		err = json.Indent(&out, []byte(converted), "", "  ")
 		if err != nil {
 			// Still not valid, return original
 			return []string{line}
 		}
 	}
 
-	// Build result: prefix on first line, then indented JSON
+	// Build result: prefix on first line, then indented JSON, then suffix
 	formatted := out.String()
 	jsonLines := strings.Split(formatted, "\n")
 
@@ -230,7 +296,13 @@ func formatJSON(line string) []string {
 	if prefix != "" {
 		result = append(result, prefix)
 	}
-	result = append(result, jsonLines...)
+	for i, jl := range jsonLines {
+		if i == len(jsonLines)-1 && suffix != "" {
+			result = append(result, jl+suffix)
+		} else {
+			result = append(result, jl)
+		}
+	}
 
 	return result
 }
@@ -241,13 +313,9 @@ func isJSON(line string) bool {
 	if jsonStart == -1 {
 		return false
 	}
-	// Quick validation: try to find matching bracket
-	jsonPart := line[jsonStart:]
-	if len(jsonPart) < 2 {
-		return false
-	}
-	// Must start with { or [
-	return jsonPart[0] == '{' || jsonPart[0] == '['
+	// Check if we can find a matching closing bracket
+	jsonEnd := findJSONEnd(line, jsonStart)
+	return jsonEnd != -1
 }
 
 type Viewer struct {
