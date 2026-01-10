@@ -129,34 +129,121 @@ func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, te
 	return fg, bg
 }
 
-// formatJSON attempts to pretty-print a JSON line, returns original if not valid JSON
-func formatJSON(line string) []string {
-	trimmed := strings.TrimSpace(line)
-	if len(trimmed) == 0 {
-		return []string{line}
+// findJSONStart finds the start index of embedded JSON in a line
+// Returns -1 if no JSON found
+func findJSONStart(line string) int {
+	// Look for JSON after common prefixes like ": {", "= {", ": [", "= ["
+	for i := 0; i < len(line); i++ {
+		if line[i] == '{' || line[i] == '[' {
+			return i
+		}
 	}
-	// Quick check: must start with { or [
-	if trimmed[0] != '{' && trimmed[0] != '[' {
-		return []string{line}
-	}
-
-	var out bytes.Buffer
-	err := json.Indent(&out, []byte(trimmed), "", "  ")
-	if err != nil {
-		return []string{line}
-	}
-
-	// Split into lines
-	return strings.Split(out.String(), "\n")
+	return -1
 }
 
-// isJSON checks if a line looks like JSON
+// stripANSIForJSON removes ANSI escape codes from a string for JSON parsing
+func stripANSIForJSON(s string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Skip until we find the end of the escape sequence
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++ // Skip the final letter
+			}
+			i = j
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
+}
+
+// pythonToJSON converts Python dict syntax to JSON
+func pythonToJSON(s string) string {
+	// First strip ANSI escape codes
+	result := stripANSIForJSON(s)
+	
+	// Replace Python booleans and None
+	// Replace True/False/None that are not part of larger words
+	// This is a simple heuristic - replace when followed by comma, }, ], or whitespace
+	replacements := []struct{ old, new string }{
+		{"True,", "true,"},
+		{"True}", "true}"},
+		{"True]", "true]"},
+		{"True ", "true "},
+		{"False,", "false,"},
+		{"False}", "false}"},
+		{"False]", "false]"},
+		{"False ", "false "},
+		{"None,", "null,"},
+		{"None}", "null}"},
+		{"None]", "null]"},
+		{"None ", "null "},
+	}
+	for _, r := range replacements {
+		result = strings.ReplaceAll(result, r.old, r.new)
+	}
+	// Replace single quotes with double quotes (simple approach)
+	result = strings.ReplaceAll(result, "'", "\"")
+	return result
+}
+
+// formatJSON attempts to pretty-print JSON/Python dict in a line
+func formatJSON(line string) []string {
+	jsonStart := findJSONStart(line)
+	if jsonStart == -1 {
+		return []string{line}
+	}
+
+	prefix := line[:jsonStart]
+	jsonPart := line[jsonStart:]
+
+	// Try as-is first (valid JSON)
+	var out bytes.Buffer
+	err := json.Indent(&out, []byte(jsonPart), "  ", "  ")
+	if err != nil {
+		// Try converting from Python dict syntax
+		converted := pythonToJSON(jsonPart)
+		out.Reset()
+		err = json.Indent(&out, []byte(converted), "  ", "  ")
+		if err != nil {
+			// Still not valid, return original
+			return []string{line}
+		}
+	}
+
+	// Build result: prefix on first line, then indented JSON
+	formatted := out.String()
+	jsonLines := strings.Split(formatted, "\n")
+
+	result := make([]string, 0, len(jsonLines)+1)
+	if prefix != "" {
+		result = append(result, prefix)
+	}
+	result = append(result, jsonLines...)
+
+	return result
+}
+
+// isJSON checks if a line contains JSON
 func isJSON(line string) bool {
-	trimmed := strings.TrimSpace(line)
-	if len(trimmed) == 0 {
+	jsonStart := findJSONStart(line)
+	if jsonStart == -1 {
 		return false
 	}
-	return trimmed[0] == '{' || trimmed[0] == '['
+	// Quick validation: try to find matching bracket
+	jsonPart := line[jsonStart:]
+	if len(jsonPart) < 2 {
+		return false
+	}
+	// Must start with { or [
+	return jsonPart[0] == '{' || jsonPart[0] == '['
 }
 
 type Viewer struct {
