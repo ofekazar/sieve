@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,15 +152,19 @@ type App struct {
 
 // SearchState holds the current search results
 type SearchState struct {
-	query    string // Current search query
-	matches  []int  // Line indices that match
-	current  int    // Current match index (-1 if none)
-	backward bool   // True if last search was backward (?)
+	query    string         // Current search query
+	regex    *regexp.Regexp // Compiled regex pattern
+	isRegex  bool           // True if regex mode is enabled
+	matches  []int          // Line indices that match
+	current  int            // Current match index (-1 if none)
+	backward bool           // True if last search was backward (?)
 }
 
 // Clear resets the search state
 func (s *SearchState) Clear() {
 	s.query = ""
+	s.regex = nil
+	s.isRegex = false
 	s.matches = nil
 	s.current = -1
 	s.backward = false
@@ -206,14 +211,30 @@ func (s *SearchState) Prev() int {
 
 // Search performs a search starting from startLine, returns the first match line index or -1
 // If backward is true, searches upward; otherwise searches downward
-func (s *SearchState) Search(lines []string, query string, startLine int, backward bool) int {
+func (s *SearchState) Search(lines []string, query string, startLine int, backward bool, isRegex bool) int {
 	s.query = query
+	s.isRegex = isRegex
 	s.matches = nil
 	s.current = -1
 	s.backward = backward
 
+	// Compile regex pattern
+	var re *regexp.Regexp
+	if isRegex {
+		var err error
+		re, err = regexp.Compile(query)
+		if err != nil {
+			// Invalid regex, treat as literal
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else {
+		// Literal string search - escape regex metacharacters
+		re = regexp.MustCompile(regexp.QuoteMeta(query))
+	}
+	s.regex = re
+
 	for i, line := range lines {
-		if strings.Contains(line, query) {
+		if s.regex.MatchString(line) {
 			s.matches = append(s.matches, i)
 		}
 	}
@@ -488,12 +509,24 @@ func (v *Viewer) resize(width, height int) {
 
 // promptForInput shows a prompt at the bottom line and collects user input
 func (v *Viewer) promptForInput(prompt string) (string, bool) {
+	input, _, ok := v.promptForInputWithRegex(prompt, false)
+	return input, ok
+}
+
+// promptForInputWithRegex prompts for input with optional regex toggle (Ctrl+R)
+// Returns: input string, isRegex flag, ok
+func (v *Viewer) promptForInputWithRegex(prompt string, allowRegexToggle bool) (string, bool, bool) {
 	input := ""
+	isRegex := false
 
 	for {
 		// Draw the prompt line at the bottom
 		statusY := v.height
-		line := prompt + input
+		regexIndicator := ""
+		if allowRegexToggle && isRegex {
+			regexIndicator = "[regex] "
+		}
+		line := prompt + regexIndicator + input
 
 		// Clear the status line first
 		for i := 0; i < v.width; i++ {
@@ -521,15 +554,17 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 		case termbox.EventKey:
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
-				return input, true
+				return input, isRegex, true
 			} else if ev.Key == termbox.KeyEsc {
 				termbox.HideCursor()
-				return "", false
+				return "", false, false
 			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
 				if len(input) > 0 {
 					runes := []rune(input)
 					input = string(runes[:len(runes)-1])
 				}
+			} else if ev.Key == termbox.KeyCtrlR && allowRegexToggle {
+				isRegex = !isRegex
 			} else if ev.Ch != 0 {
 				input += string(ev.Ch)
 			} else if ev.Key == termbox.KeySpace {
@@ -897,10 +932,10 @@ func (a *App) HandleSearch(backward bool) {
 		noMatchMsg = "BOF - no more matches"
 	}
 
-	query, ok := current.promptForInput(prompt)
+	query, isRegex, ok := current.promptForInputWithRegex(prompt, true)
 	if ok && query != "" {
 		lines := current.GetLines()
-		lineIdx := a.search.Search(lines, query, current.topLine, backward)
+		lineIdx := a.search.Search(lines, query, current.topLine, backward, isRegex)
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
@@ -969,7 +1004,6 @@ func (a *App) Draw() {
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
 	lineCount := current.LineCount()
-	searchQuery := a.search.query
 
 	for screenY := 0; screenY < current.height; screenY++ {
 		lineIndex := current.topLine + screenY
@@ -981,7 +1015,7 @@ func (a *App) Draw() {
 
 		// Find search match positions in this line (on the raw text without ANSI)
 		var matchPositions []bool
-		if searchQuery != "" {
+		if a.search.regex != nil {
 			matchPositions = make([]bool, len(cells))
 			// Strip ANSI for search matching
 			plainText := make([]rune, len(cells))
@@ -989,19 +1023,15 @@ func (a *App) Draw() {
 				plainText[i] = c.char
 			}
 			plainStr := string(plainText)
-			searchIdx := 0
-			for {
-				idx := strings.Index(plainStr[searchIdx:], searchQuery)
-				if idx == -1 {
-					break
+			// Use regex to find all matches
+			matches := a.search.regex.FindAllStringIndex(plainStr, -1)
+			for _, match := range matches {
+				// Convert byte indices to rune indices
+				startRune := len([]rune(plainStr[:match[0]]))
+				endRune := len([]rune(plainStr[:match[1]]))
+				for j := startRune; j < endRune && j < len(matchPositions); j++ {
+					matchPositions[j] = true
 				}
-				matchStart := searchIdx + idx
-				for j := 0; j < len(searchQuery); j++ {
-					if matchStart+j < len(matchPositions) {
-						matchPositions[matchStart+j] = true
-					}
-				}
-				searchIdx = matchStart + 1
 			}
 		}
 
