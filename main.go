@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nsf/termbox-go"
 )
 
 type Viewer struct {
-	lines   []string // All lines from the file
-	topLine int      // Index of the line at the top of the screen
-	leftCol int      // Horizontal scroll offset
-	width   int      // Terminal width
-	height  int      // Terminal height
+	lines   []string     // All lines from the file
+	mu      sync.RWMutex // Protects lines during background loading
+	loading bool         // True while file is still loading
+	topLine int          // Index of the line at the top of the screen
+	leftCol int          // Horizontal scroll offset
+	width   int          // Terminal width
+	height  int          // Terminal height
 }
 
 // ViewerStack manages a stack of viewers for filtering navigation
@@ -132,51 +135,102 @@ func NewViewer(filename string) (*Viewer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	// Handle very long lines
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return &Viewer{
-		lines:   lines,
+	v := &Viewer{
+		lines:   nil,
+		loading: true,
 		topLine: 0,
 		leftCol: 0,
-	}, nil
+	}
+
+	// Load file in background
+	go func() {
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		// Handle very long lines
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 10*1024*1024)
+
+		lineCount := 0
+		for scanner.Scan() {
+			v.mu.Lock()
+			v.lines = append(v.lines, scanner.Text())
+			v.mu.Unlock()
+
+			lineCount++
+			// Trigger redraw periodically during initial load
+			if lineCount <= 100 || lineCount%1000 == 0 {
+				termbox.Interrupt()
+			}
+		}
+
+		v.mu.Lock()
+		v.loading = false
+		v.mu.Unlock()
+		termbox.Interrupt() // Final redraw when done
+	}()
+
+	return v, nil
 }
 
 // NewViewerFromLines creates a Viewer from an existing slice of lines
 func NewViewerFromLines(lines []string) *Viewer {
 	return &Viewer{
 		lines:   lines,
+		loading: false,
 		topLine: 0,
 		leftCol: 0,
 	}
+}
+
+// LineCount returns the number of lines (thread-safe)
+func (v *Viewer) LineCount() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.lines)
+}
+
+// GetLine returns a line at index (thread-safe), or empty string if out of bounds
+func (v *Viewer) GetLine(idx int) string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if idx < 0 || idx >= len(v.lines) {
+		return ""
+	}
+	return v.lines[idx]
+}
+
+// GetLines returns a copy of lines slice (thread-safe)
+func (v *Viewer) GetLines() []string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	result := make([]string, len(v.lines))
+	copy(result, v.lines)
+	return result
+}
+
+// IsLoading returns true if still loading (thread-safe)
+func (v *Viewer) IsLoading() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.loading
 }
 
 func (v *Viewer) draw() {
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
 	// Draw visible lines
+	lineCount := v.LineCount()
 	for screenY := 0; screenY < v.height; screenY++ {
 		lineIndex := v.topLine + screenY
 
 		// Check if we've run out of lines
-		if lineIndex >= len(v.lines) {
+		if lineIndex >= lineCount {
 			break
 		}
 
-		line := v.lines[lineIndex]
+		line := v.GetLine(lineIndex)
 		runes := []rune(line)
 
 		// Draw each character in the line
@@ -209,13 +263,19 @@ func (v *Viewer) drawStatusBar() {
 
 func (v *Viewer) drawStatusBarWithDepth(depth int) {
 	statusY := v.height
+	lineCount := v.LineCount()
+	loadingStr := ""
+	if v.IsLoading() {
+		loadingStr = " [loading...]"
+	}
+
 	var status string
 	if depth > 1 {
-		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d | ^U:back =:reset q:quit ",
-			v.topLine+1, len(v.lines), v.leftCol, depth)
+		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d | ^U:back =:reset q:quit%s ",
+			v.topLine+1, lineCount, v.leftCol, depth, loadingStr)
 	} else {
-		status = fmt.Sprintf(" Line %d/%d | Col %d | Press 'q' to quit ",
-			v.topLine+1, len(v.lines), v.leftCol)
+		status = fmt.Sprintf(" Line %d/%d | Col %d | Press 'q' to quit%s ",
+			v.topLine+1, lineCount, v.leftCol, loadingStr)
 	}
 
 	// Clear the status line first
@@ -256,7 +316,7 @@ func (v *Viewer) navigateUp() {
 }
 
 func (v *Viewer) navigateDown() {
-	maxTop := len(v.lines) - 2
+	maxTop := v.LineCount() - 2
 	if maxTop < 0 {
 		maxTop = 0
 	}
@@ -280,7 +340,7 @@ func (v *Viewer) navigateRight(amount int) {
 func (v *Viewer) pageDown() {
 	v.topLine += v.height
 	// Allow scrolling until last line is at top
-	maxTop := len(v.lines) - 2
+	maxTop := v.LineCount() - 2
 	if maxTop < 0 {
 		maxTop = 0
 	}
@@ -302,7 +362,7 @@ func (v *Viewer) goToStart() {
 
 func (v *Viewer) goToEnd() {
 	// Go to last line at top
-	v.topLine = len(v.lines) - 2
+	v.topLine = v.LineCount() - 2
 	if v.topLine < 0 {
 		v.topLine = 0
 	}
@@ -372,9 +432,10 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 
 // filterLines returns lines based on query match
 // If keep is true, returns lines containing query; if false, returns lines NOT containing query
-func (v *Viewer) filterLines(query string, keep bool) []string {
+// filterLinesSlice filters a slice of lines based on query match
+func filterLinesSlice(lines []string, query string, keep bool) []string {
 	var filtered []string
-	for _, line := range v.lines {
+	for _, line := range lines {
 		matches := strings.Contains(line, query)
 		if matches == keep {
 			filtered = append(filtered, line)
@@ -454,7 +515,8 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, ok := current.promptForInput(prompt)
 	if ok && query != "" {
-		filtered := current.filterLines(query, keep)
+		lines := current.GetLines() // Get snapshot for thread-safety
+		filtered := filterLinesSlice(lines, query, keep)
 		if len(filtered) > 0 {
 			newViewer := NewViewerFromLines(filtered)
 
@@ -462,8 +524,8 @@ func (a *App) HandleFilter(keep bool) {
 			// Count how many remaining lines appear before it to get new position
 			matchesBefore := 0
 			foundMatch := false
-			for i := 0; i < len(current.lines); i++ {
-				matches := strings.Contains(current.lines[i], query)
+			for i := 0; i < len(lines); i++ {
+				matches := strings.Contains(lines[i], query)
 				if matches == keep {
 					if i >= currentTopLine && !foundMatch {
 						foundMatch = true
@@ -486,22 +548,21 @@ func (a *App) HandleFilter(keep bool) {
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
-	currentLine := ""
-	if current.topLine < len(current.lines) {
-		currentLine = current.lines[current.topLine]
-	}
+	currentLine := current.GetLine(current.topLine)
 
 	query, ok := current.promptForInput("+")
 	if ok && query != "" {
 		original := a.stack.viewers[0]
+		currentLines := current.GetLines()
+		originalLines := original.GetLines()
 
 		currentCounts := make(map[string]int)
-		for _, line := range current.lines {
+		for _, line := range currentLines {
 			currentCounts[line]++
 		}
 
 		var combined []string
-		for _, line := range original.lines {
+		for _, line := range originalLines {
 			if currentCounts[line] > 0 {
 				combined = append(combined, line)
 				currentCounts[line]--
@@ -542,7 +603,8 @@ func (a *App) HandleSearch(backward bool) {
 
 	query, ok := current.promptForInput(prompt)
 	if ok && query != "" {
-		lineIdx := a.search.Search(current.lines, query, current.topLine, backward)
+		lines := current.GetLines()
+		lineIdx := a.search.Search(lines, query, current.topLine, backward)
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
@@ -581,10 +643,7 @@ func (a *App) HandleSearchNav(reverse bool) {
 // If reset is true (=), resets to first viewer; if false (^U), pops one level
 func (a *App) HandleStackNav(reset bool) {
 	current := a.stack.Current()
-	currentLine := ""
-	if current.topLine < len(current.lines) {
-		currentLine = current.lines[current.topLine]
-	}
+	currentLine := current.GetLine(current.topLine)
 
 	var changed bool
 	if reset {
@@ -596,7 +655,8 @@ func (a *App) HandleStackNav(reset bool) {
 	if changed && currentLine != "" {
 		// Find this line in the new current viewer to stay on the same line
 		newCurrent := a.stack.Current()
-		for i, line := range newCurrent.lines {
+		newLines := newCurrent.GetLines()
+		for i, line := range newLines {
 			if line == currentLine {
 				newCurrent.topLine = i
 				break
@@ -612,12 +672,13 @@ func (a *App) Draw() {
 	current.resize(termbox.Size())
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
+	lineCount := current.LineCount()
 	for screenY := 0; screenY < current.height; screenY++ {
 		lineIndex := current.topLine + screenY
-		if lineIndex >= len(current.lines) {
+		if lineIndex >= lineCount {
 			break
 		}
-		line := current.lines[lineIndex]
+		line := current.GetLine(lineIndex)
 		runes := []rune(line)
 		screenX := 0
 		for i, char := range runes {
