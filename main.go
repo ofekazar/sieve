@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -277,6 +279,8 @@ type App struct {
 	history       *History // Shared history for filters and searches
 	statusMessage string
 	messageExpiry time.Time
+	visualMode    bool // True when in visual selection mode
+	visualStart   int  // Starting line of visual selection
 }
 
 // History manages persistent command history (for filters and searches)
@@ -738,6 +742,23 @@ func (v *Viewer) showMessage(msg string) {
 	termbox.Flush()
 }
 
+// drawVisualStatusBar draws the status bar in visual mode
+func (a *App) drawVisualStatusBar(v *Viewer, status string) {
+	statusY := v.height
+
+	// Clear the status line
+	for i := 0; i < v.width; i++ {
+		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+	}
+
+	for i, char := range status {
+		if i >= v.width {
+			break
+		}
+		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+	}
+}
+
 // getExpandedLineCount returns how many screen rows a line expands to
 func (v *Viewer) getExpandedLineCount(lineIdx int) int {
 	if lineIdx < 0 || lineIdx >= v.LineCount() {
@@ -1182,6 +1203,70 @@ func (a *App) ShowTempMessage(msg string) {
 	}()
 }
 
+// copyToClipboard copies text to system clipboard
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	default:
+		return fmt.Errorf("clipboard not supported on %s", runtime.GOOS)
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+// EnterVisualMode starts visual line selection
+func (a *App) EnterVisualMode() {
+	current := a.stack.Current()
+	a.visualMode = true
+	a.visualStart = current.topLine
+	a.ShowTempMessage("-- VISUAL --")
+}
+
+// ExitVisualMode exits visual mode without action
+func (a *App) ExitVisualMode() {
+	a.visualMode = false
+	a.visualStart = 0
+}
+
+// YankVisualSelection copies selected lines to clipboard
+func (a *App) YankVisualSelection() {
+	if !a.visualMode {
+		return
+	}
+
+	current := a.stack.Current()
+	startLine := a.visualStart
+	endLine := current.topLine
+
+	// Ensure start <= end
+	if startLine > endLine {
+		startLine, endLine = endLine, startLine
+	}
+
+	// Collect lines
+	var lines []string
+	for i := startLine; i <= endLine; i++ {
+		lines = append(lines, current.GetLine(i))
+	}
+
+	text := strings.Join(lines, "\n")
+	err := copyToClipboard(text)
+
+	a.visualMode = false
+	a.visualStart = 0
+
+	if err != nil {
+		a.ShowTempMessage("Clipboard error: " + err.Error())
+	} else {
+		count := endLine - startLine + 1
+		a.ShowTempMessage(fmt.Sprintf("Yanked %d line(s)", count))
+	}
+}
+
 // ShowHelp displays the help screen
 func (a *App) ShowHelp() {
 	type helpEntry struct {
@@ -1223,8 +1308,9 @@ func (a *App) ShowHelp() {
 			{"w", "Toggle wrap"},
 			{"f", "Toggle JSON"},
 			{"K", "Sticky left cols"},
+			{"v", "Visual select"},
+			{"y", "Yank selection"},
 			{";", "Export to file"},
-			{"H / F1", "This help"},
 			{"q / Esc", "Quit"},
 		}},
 	}
@@ -1837,7 +1923,18 @@ func (a *App) Draw() {
 		a.drawNormal(current, lineCount)
 	}
 
-	if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
+	if a.visualMode {
+		// Visual mode status bar
+		startLine := a.visualStart
+		endLine := current.topLine
+		if startLine > endLine {
+			startLine, endLine = endLine, startLine
+		}
+		status := fmt.Sprintf(" VISUAL: Line %d/%d | Marked %d-%d ",
+			current.topLine+1, current.LineCount(), startLine+1, endLine+1)
+		a.drawVisualStatusBar(current, status)
+		termbox.Flush()
+	} else if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
 		current.showMessage(a.statusMessage)
 	} else {
 		a.statusMessage = ""
@@ -1871,8 +1968,21 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 		stickyWidth = current.width / 2 // Cap at half screen
 	}
 
+	// Visual selection range
+	var visualStart, visualEnd int
+	if a.visualMode {
+		visualStart = a.visualStart
+		visualEnd = current.topLine
+		if visualStart > visualEnd {
+			visualStart, visualEnd = visualEnd, visualStart
+		}
+	}
+
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
+
+		// Check if this line is in visual selection
+		inVisualSelection := a.visualMode && lineIndex >= visualStart && lineIndex <= visualEnd
 
 		// Expand JSON if enabled
 		var linesToRender []string
@@ -1896,6 +2006,9 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 
 			screenX := 0
 
+			// Visual selection background color
+			visualBg := termbox.Attribute(239) // Dark gray for selection
+
 			if stickyActive {
 				// Draw sticky left columns in pastel blue
 				for i := 0; i < stickyWidth && i < len(cells); i++ {
@@ -1904,6 +2017,9 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 					}
 					fg := stickyFg
 					bg := termbox.ColorDefault
+					if inVisualSelection {
+						bg = visualBg
+					}
 					// Preserve search highlighting even in sticky area
 					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
 						fg = termbox.ColorBlack
@@ -1924,12 +2040,22 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 						break
 					}
 					fg, bg := cells[i].fg, cells[i].bg
+					if inVisualSelection {
+						bg = visualBg
+					}
 					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
 						fg = termbox.ColorBlack
 						bg = termbox.ColorYellow
 					}
 					termbox.SetCell(screenX, screenY, cells[i].char, fg, bg)
 					screenX++
+				}
+				// Fill rest of line with selection color if in visual mode
+				if inVisualSelection {
+					for screenX < current.width {
+						termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, visualBg)
+						screenX++
+					}
 				}
 			} else {
 				// Normal rendering (no sticky)
@@ -1941,12 +2067,22 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 						break
 					}
 					fg, bg := cell.fg, cell.bg
+					if inVisualSelection {
+						bg = visualBg
+					}
 					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
 						fg = termbox.ColorBlack
 						bg = termbox.ColorYellow
 					}
 					termbox.SetCell(screenX, screenY, cell.char, fg, bg)
 					screenX++
+				}
+				// Fill rest of line with selection color if in visual mode
+				if inVisualSelection {
+					for screenX < current.width {
+						termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, visualBg)
+						screenX++
+					}
 				}
 			}
 			screenY++
@@ -2156,6 +2292,14 @@ func (v *Viewer) run() error {
 					current.navigateLeft(1)
 				case 'K':
 					app.HandleStickyLeft()
+				case 'v':
+					if !app.visualMode {
+						app.EnterVisualMode()
+					}
+				case 'y':
+					if app.visualMode {
+						app.YankVisualSelection()
+					}
 				}
 			} else {
 				switch ev.Key {
@@ -2179,7 +2323,13 @@ func (v *Viewer) run() error {
 					app.HandleStackNav(false)
 				case termbox.KeyF1:
 					app.ShowHelp()
-				case termbox.KeyEsc, termbox.KeyCtrlC:
+				case termbox.KeyEsc:
+					if app.visualMode {
+						app.ExitVisualMode()
+					} else {
+						return nil
+					}
+				case termbox.KeyCtrlC:
 					return nil
 				}
 			}
