@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -265,6 +266,7 @@ type Viewer struct {
 	height           int          // Terminal height
 	expandedCache    map[int]int  // Cache of expanded line counts (lineIdx -> rowCount)
 	expandedCacheKey string       // Key to invalidate cache (mode+width)
+	follow           bool         // Follow mode (like tail -f)
 }
 
 // ViewerStack manages a stack of viewers for filtering navigation
@@ -522,9 +524,66 @@ func NewViewer(filename string) (*Viewer, error) {
 	go func() {
 		defer file.Close()
 		loadFromReader(v, file)
+
+		// If follow mode is enabled, keep watching for new content
+		if v.follow {
+			go v.followFile(filename)
+		}
 	}()
 
 	return v, nil
+}
+
+// followFile watches a file for new content and appends it
+func (v *Viewer) followFile(filename string) {
+	for v.follow {
+		time.Sleep(100 * time.Millisecond)
+
+		file, err := os.Open(filename)
+		if err != nil {
+			continue
+		}
+
+		// Get current line count
+		v.mu.RLock()
+		currentLines := len(v.lines)
+		v.mu.RUnlock()
+
+		// Skip to where we left off
+		scanner := bufio.NewScanner(file)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 10*1024*1024)
+
+		lineNum := 0
+		var newLines []string
+		for scanner.Scan() {
+			lineNum++
+			if lineNum > currentLines {
+				newLines = append(newLines, scanner.Text())
+			}
+		}
+		file.Close()
+
+		if len(newLines) > 0 {
+			// Check if we're at the bottom before adding lines
+			v.mu.RLock()
+			atBottom := v.topLine >= len(v.lines)-v.height
+			v.mu.RUnlock()
+
+			v.mu.Lock()
+			v.lines = append(v.lines, newLines...)
+			if atBottom {
+				// Auto-scroll to bottom
+				v.topLine = len(v.lines) - v.height
+				if v.topLine < 0 {
+					v.topLine = 0
+				}
+			}
+			v.mu.Unlock()
+
+			termbox.Interrupt()
+		}
+	}
 }
 
 // NewViewerFromStdin creates a Viewer that reads from stdin
@@ -681,6 +740,9 @@ func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) 
 		loadingStr = " [loading...]"
 	}
 	modeStr := ""
+	if v.follow {
+		modeStr += " [follow]"
+	}
 	if v.wordWrap {
 		modeStr += " [wrap]"
 	}
@@ -2060,6 +2122,22 @@ func (a *App) HandleStickyLeft() {
 	}
 }
 
+// ToggleFollow toggles follow mode for the root viewer
+func (a *App) ToggleFollow() {
+	// Follow mode only works on the root viewer
+	root := a.stack.viewers[0]
+	root.follow = !root.follow
+	if root.follow {
+		// Start following if not already
+		go root.followFile(root.filename)
+		// Jump to end
+		root.goToEnd()
+		a.ShowTempMessage("Follow mode ON")
+	} else {
+		a.ShowTempMessage("Follow mode OFF")
+	}
+}
+
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
@@ -2548,6 +2626,8 @@ func (v *Viewer) run() error {
 				case 'f':
 					current.jsonPretty = !current.jsonPretty
 					current.topLineOffset = 0 // Reset line offset
+				case 'F':
+					app.ToggleFollow()
 				case '&':
 					app.HandleFilter(true)
 				case '-':
@@ -2824,6 +2904,14 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 }
 
 func main() {
+	// Parse command line flags
+	followFlag := flag.Bool("f", false, "Follow mode (like tail -f)")
+	followLongFlag := flag.Bool("follow", false, "Follow mode (like tail -f)")
+	flag.Parse()
+
+	follow := *followFlag || *followLongFlag
+	args := flag.Args()
+
 	var viewer *Viewer
 	var err error
 
@@ -2832,25 +2920,28 @@ func main() {
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		// stdin has data (pipe or redirect)
 		viewer = NewViewerFromStdin()
-	} else if len(os.Args) >= 3 {
+	} else if len(args) >= 2 {
 		// Multiple files - merge sort by timestamp
-		viewer, err = NewViewerFromMultipleFiles(os.Args[1:])
+		viewer, err = NewViewerFromMultipleFiles(args)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading files: %v\n", err)
 			os.Exit(1)
 		}
-	} else if len(os.Args) >= 2 {
+	} else if len(args) >= 1 {
 		// Single file
-		viewer, err = NewViewer(os.Args[1])
+		viewer, err = NewViewer(args[0])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
-		fmt.Println("Usage: cut <filename> [filename2] [filename3] ...")
+		fmt.Println("Usage: cut [-f|--follow] <filename> [filename2] [filename3] ...")
 		fmt.Println("       command | cut")
 		os.Exit(1)
 	}
+
+	// Set follow mode
+	viewer.follow = follow
 
 	if err := viewer.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
