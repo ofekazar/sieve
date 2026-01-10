@@ -132,6 +132,7 @@ type Viewer struct {
 	mu       sync.RWMutex // Protects lines during background loading
 	loading  bool         // True while file is still loading
 	filename string       // Original filename (empty for filtered views)
+	wordWrap bool         // Word wrap mode
 	topLine  int          // Index of the line at the top of the screen
 	leftCol  int          // Horizontal scroll offset
 	width    int          // Terminal width
@@ -500,14 +501,18 @@ func (v *Viewer) drawStatusBarWithDepth(depth int) {
 	if v.IsLoading() {
 		loadingStr = " [loading...]"
 	}
+	wrapStr := ""
+	if v.wordWrap {
+		wrapStr = " [wrap]"
+	}
 
 	var status string
 	if depth > 1 {
-		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d | ^U:back =:reset q:quit%s ",
-			v.topLine+1, lineCount, v.leftCol, depth, loadingStr)
+		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d%s%s | ^U:back =:reset q:quit ",
+			v.topLine+1, lineCount, v.leftCol, depth, wrapStr, loadingStr)
 	} else {
-		status = fmt.Sprintf(" Line %d/%d | Col %d | Press 'q' to quit%s ",
-			v.topLine+1, lineCount, v.leftCol, loadingStr)
+		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Press 'q' to quit ",
+			v.topLine+1, lineCount, v.leftCol, wrapStr, loadingStr)
 	}
 
 	// Clear the status line first
@@ -1299,6 +1304,23 @@ func (a *App) Draw() {
 
 	lineCount := current.LineCount()
 
+	if current.wordWrap {
+		a.drawWrapped(current, lineCount)
+	} else {
+		a.drawNormal(current, lineCount)
+	}
+
+	if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
+		current.showMessage(a.statusMessage)
+	} else {
+		a.statusMessage = ""
+		current.drawStatusBarWithDepth(len(a.stack.viewers))
+		termbox.Flush()
+	}
+}
+
+// drawNormal renders without word wrap
+func (a *App) drawNormal(current *Viewer, lineCount int) {
 	for screenY := 0; screenY < current.height; screenY++ {
 		lineIndex := current.topLine + screenY
 		if lineIndex >= lineCount {
@@ -1306,28 +1328,7 @@ func (a *App) Draw() {
 		}
 		line := current.GetLine(lineIndex)
 		cells := parseANSI(line)
-
-		// Find search match positions in this line (on the raw text without ANSI)
-		var matchPositions []bool
-		if a.search.regex != nil {
-			matchPositions = make([]bool, len(cells))
-			// Strip ANSI for search matching
-			plainText := make([]rune, len(cells))
-			for i, c := range cells {
-				plainText[i] = c.char
-			}
-			plainStr := string(plainText)
-			// Use regex to find all matches
-			matches := a.search.regex.FindAllStringIndex(plainStr, -1)
-			for _, match := range matches {
-				// Convert byte indices to rune indices
-				startRune := len([]rune(plainStr[:match[0]]))
-				endRune := len([]rune(plainStr[:match[1]]))
-				for j := startRune; j < endRune && j < len(matchPositions); j++ {
-					matchPositions[j] = true
-				}
-			}
-		}
+		matchPositions := a.getMatchPositions(cells)
 
 		screenX := 0
 		for i, cell := range cells {
@@ -1338,7 +1339,6 @@ func (a *App) Draw() {
 				break
 			}
 			fg, bg := cell.fg, cell.bg
-			// Highlight search matches
 			if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
 				fg = termbox.ColorBlack
 				bg = termbox.ColorYellow
@@ -1347,14 +1347,68 @@ func (a *App) Draw() {
 			screenX++
 		}
 	}
+}
 
-	if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
-		current.showMessage(a.statusMessage)
-	} else {
-		a.statusMessage = ""
-		current.drawStatusBarWithDepth(len(a.stack.viewers))
-		termbox.Flush()
+// drawWrapped renders with word wrap
+func (a *App) drawWrapped(current *Viewer, lineCount int) {
+	screenY := 0
+	lineIndex := current.topLine
+
+	for screenY < current.height && lineIndex < lineCount {
+		line := current.GetLine(lineIndex)
+		cells := parseANSI(line)
+		matchPositions := a.getMatchPositions(cells)
+
+		if len(cells) == 0 {
+			// Empty line
+			screenY++
+			lineIndex++
+			continue
+		}
+
+		// Wrap the line across multiple screen rows
+		cellIdx := 0
+		for cellIdx < len(cells) && screenY < current.height {
+			screenX := 0
+			for screenX < current.width && cellIdx < len(cells) {
+				cell := cells[cellIdx]
+				fg, bg := cell.fg, cell.bg
+				if matchPositions != nil && cellIdx < len(matchPositions) && matchPositions[cellIdx] {
+					fg = termbox.ColorBlack
+					bg = termbox.ColorYellow
+				}
+				termbox.SetCell(screenX, screenY, cell.char, fg, bg)
+				screenX++
+				cellIdx++
+			}
+			screenY++
+		}
+		lineIndex++
 	}
+}
+
+// getMatchPositions returns search match positions for highlighting
+func (a *App) getMatchPositions(cells []ansiCell) []bool {
+	if a.search.regex == nil {
+		return nil
+	}
+
+	matchPositions := make([]bool, len(cells))
+	plainText := make([]rune, len(cells))
+	for i, c := range cells {
+		plainText[i] = c.char
+	}
+	plainStr := string(plainText)
+
+	matches := a.search.regex.FindAllStringIndex(plainStr, -1)
+	for _, match := range matches {
+		startRune := len([]rune(plainStr[:match[0]]))
+		endRune := len([]rune(plainStr[:match[1]]))
+		for j := startRune; j < endRune && j < len(matchPositions); j++ {
+			matchPositions[j] = true
+		}
+	}
+	return matchPositions
 }
 
 func (v *Viewer) run() error {
@@ -1393,6 +1447,9 @@ func (v *Viewer) run() error {
 					current.navigateLeft(current.width / 4)
 				case 'l':
 					current.navigateRight(current.width / 4)
+				case 'w':
+					current.wordWrap = !current.wordWrap
+					current.leftCol = 0 // Reset horizontal scroll when toggling wrap
 				case 'g':
 					current.goToStart()
 				case 'G':
