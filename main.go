@@ -386,7 +386,7 @@ func NewViewer(filename string) (*Viewer, error) {
 		leftCol:  0,
 	}
 
-	// Load file in background (sequential - optimal for I/O bound disk reads)
+	// Load file in background with batched updates for performance
 	go func() {
 		defer file.Close()
 
@@ -394,16 +394,32 @@ func NewViewer(filename string) (*Viewer, error) {
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 10*1024*1024)
 
-		lineCount := 0
-		for scanner.Scan() {
-			v.mu.Lock()
-			v.lines = append(v.lines, scanner.Text())
-			v.mu.Unlock()
+		const batchSize = 10000
+		batch := make([]string, 0, batchSize)
+		totalLines := 0
 
-			lineCount++
-			if lineCount <= 100 || lineCount%1000 == 0 {
-				termbox.Interrupt()
+		for scanner.Scan() {
+			batch = append(batch, scanner.Text())
+
+			if len(batch) >= batchSize {
+				v.mu.Lock()
+				v.lines = append(v.lines, batch...)
+				v.mu.Unlock()
+				totalLines += len(batch)
+				batch = batch[:0]
+
+				// Only interrupt for first batch (to show content quickly) and then sparingly
+				if totalLines == batchSize || totalLines%100000 == 0 {
+					termbox.Interrupt()
+				}
 			}
+		}
+
+		// Append remaining lines
+		if len(batch) > 0 {
+			v.mu.Lock()
+			v.lines = append(v.lines, batch...)
+			v.mu.Unlock()
 		}
 
 		v.mu.Lock()
