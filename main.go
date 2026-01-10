@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -127,16 +129,47 @@ func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, te
 	return fg, bg
 }
 
+// formatJSON attempts to pretty-print a JSON line, returns original if not valid JSON
+func formatJSON(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return []string{line}
+	}
+	// Quick check: must start with { or [
+	if trimmed[0] != '{' && trimmed[0] != '[' {
+		return []string{line}
+	}
+
+	var out bytes.Buffer
+	err := json.Indent(&out, []byte(trimmed), "", "  ")
+	if err != nil {
+		return []string{line}
+	}
+
+	// Split into lines
+	return strings.Split(out.String(), "\n")
+}
+
+// isJSON checks if a line looks like JSON
+func isJSON(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
 type Viewer struct {
-	lines    []string     // All lines from the file
-	mu       sync.RWMutex // Protects lines during background loading
-	loading  bool         // True while file is still loading
-	filename string       // Original filename (empty for filtered views)
-	wordWrap bool         // Word wrap mode
-	topLine  int          // Index of the line at the top of the screen
-	leftCol  int          // Horizontal scroll offset
-	width    int          // Terminal width
-	height   int          // Terminal height
+	lines      []string     // All lines from the file
+	mu         sync.RWMutex // Protects lines during background loading
+	loading    bool         // True while file is still loading
+	filename   string       // Original filename (empty for filtered views)
+	wordWrap   bool         // Word wrap mode
+	jsonPretty bool         // JSON pretty-print mode
+	topLine    int          // Index of the line at the top of the screen
+	leftCol    int          // Horizontal scroll offset
+	width      int          // Terminal width
+	height     int          // Terminal height
 }
 
 // ViewerStack manages a stack of viewers for filtering navigation
@@ -526,18 +559,21 @@ func (v *Viewer) drawStatusBarWithDepth(depth int) {
 	if v.IsLoading() {
 		loadingStr = " [loading...]"
 	}
-	wrapStr := ""
+	modeStr := ""
 	if v.wordWrap {
-		wrapStr = " [wrap]"
+		modeStr += " [wrap]"
+	}
+	if v.jsonPretty {
+		modeStr += " [json]"
 	}
 
 	var status string
 	if depth > 1 {
 		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d%s%s | ^U:back =:reset q:quit ",
-			v.topLine+1, lineCount, v.leftCol, depth, wrapStr, loadingStr)
+			v.topLine+1, lineCount, v.leftCol, depth, modeStr, loadingStr)
 	} else {
 		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Press 'q' to quit ",
-			v.topLine+1, lineCount, v.leftCol, wrapStr, loadingStr)
+			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr)
 	}
 
 	// Clear the status line first
@@ -949,6 +985,8 @@ func (a *App) ShowHelp() {
 		}},
 		{"Other", []helpEntry{
 			{"w", "Toggle wrap"},
+			{"f", "Toggle JSON"},
+			{";", "Export to file"},
 			{"H / F1", "This help"},
 			{"q / Esc", "Quit"},
 		}},
@@ -1334,6 +1372,26 @@ func (a *App) HandleGotoLine() {
 	}
 }
 
+// HandleExport saves the current filtered view to a file
+func (a *App) HandleExport() {
+	current := a.stack.Current()
+	filename, ok := current.promptForInput(";")
+	if !ok || filename == "" {
+		return
+	}
+
+	lines := current.GetLines()
+	content := strings.Join(lines, "\n")
+
+	err := os.WriteFile(filename, []byte(content), 0644)
+	if err != nil {
+		a.ShowTempMessage(fmt.Sprintf("Error: %v", err))
+		return
+	}
+
+	a.ShowTempMessage(fmt.Sprintf("Saved %d lines to %s", len(lines), filename))
+}
+
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
@@ -1435,31 +1493,47 @@ func (a *App) Draw() {
 
 // drawNormal renders without word wrap
 func (a *App) drawNormal(current *Viewer, lineCount int) {
-	for screenY := 0; screenY < current.height; screenY++ {
-		lineIndex := current.topLine + screenY
-		if lineIndex >= lineCount {
-			break
-		}
-		line := current.GetLine(lineIndex)
-		cells := parseANSI(line)
-		matchPositions := a.getMatchPositions(cells)
+	screenY := 0
+	lineIndex := current.topLine
 
-		screenX := 0
-		for i, cell := range cells {
-			if i < current.leftCol {
-				continue
-			}
-			if screenX >= current.width {
+	for screenY < current.height && lineIndex < lineCount {
+		line := current.GetLine(lineIndex)
+
+		// Expand JSON if enabled
+		var linesToRender []string
+		if current.jsonPretty && isJSON(line) {
+			linesToRender = formatJSON(line)
+		} else {
+			linesToRender = []string{line}
+		}
+
+		for _, renderLine := range linesToRender {
+			if screenY >= current.height {
 				break
 			}
-			fg, bg := cell.fg, cell.bg
-			if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
-				fg = termbox.ColorBlack
-				bg = termbox.ColorYellow
+
+			cells := parseANSI(renderLine)
+			matchPositions := a.getMatchPositions(cells)
+
+			screenX := 0
+			for i, cell := range cells {
+				if i < current.leftCol {
+					continue
+				}
+				if screenX >= current.width {
+					break
+				}
+				fg, bg := cell.fg, cell.bg
+				if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
+					fg = termbox.ColorBlack
+					bg = termbox.ColorYellow
+				}
+				termbox.SetCell(screenX, screenY, cell.char, fg, bg)
+				screenX++
 			}
-			termbox.SetCell(screenX, screenY, cell.char, fg, bg)
-			screenX++
+			screenY++
 		}
+		lineIndex++
 	}
 }
 
@@ -1470,32 +1544,46 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
-		cells := parseANSI(line)
-		matchPositions := a.getMatchPositions(cells)
 
-		if len(cells) == 0 {
-			// Empty line
-			screenY++
-			lineIndex++
-			continue
+		// Expand JSON if enabled
+		var linesToRender []string
+		if current.jsonPretty && isJSON(line) {
+			linesToRender = formatJSON(line)
+		} else {
+			linesToRender = []string{line}
 		}
 
-		// Wrap the line across multiple screen rows
-		cellIdx := 0
-		for cellIdx < len(cells) && screenY < current.height {
-			screenX := 0
-			for screenX < current.width && cellIdx < len(cells) {
-				cell := cells[cellIdx]
-				fg, bg := cell.fg, cell.bg
-				if matchPositions != nil && cellIdx < len(matchPositions) && matchPositions[cellIdx] {
-					fg = termbox.ColorBlack
-					bg = termbox.ColorYellow
-				}
-				termbox.SetCell(screenX, screenY, cell.char, fg, bg)
-				screenX++
-				cellIdx++
+		for _, renderLine := range linesToRender {
+			if screenY >= current.height {
+				break
 			}
-			screenY++
+
+			cells := parseANSI(renderLine)
+			matchPositions := a.getMatchPositions(cells)
+
+			if len(cells) == 0 {
+				// Empty line
+				screenY++
+				continue
+			}
+
+			// Wrap the line across multiple screen rows
+			cellIdx := 0
+			for cellIdx < len(cells) && screenY < current.height {
+				screenX := 0
+				for screenX < current.width && cellIdx < len(cells) {
+					cell := cells[cellIdx]
+					fg, bg := cell.fg, cell.bg
+					if matchPositions != nil && cellIdx < len(matchPositions) && matchPositions[cellIdx] {
+						fg = termbox.ColorBlack
+						bg = termbox.ColorYellow
+					}
+					termbox.SetCell(screenX, screenY, cell.char, fg, bg)
+					screenX++
+					cellIdx++
+				}
+				screenY++
+			}
 		}
 		lineIndex++
 	}
@@ -1608,6 +1696,10 @@ func (v *Viewer) run() error {
 					current.goToEnd()
 				case ':':
 					app.HandleGotoLine()
+				case ';':
+					app.HandleExport()
+				case 'f':
+					current.jsonPretty = !current.jsonPretty
 				case '&':
 					app.HandleFilter(true)
 				case '-':
