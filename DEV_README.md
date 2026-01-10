@@ -198,7 +198,7 @@ type History struct {
 ```
 
 **Persistence:**
-- File: `/tmp/cut_history`
+- File: `/tmp/sieve_history`
 - Format: Newline-separated entries
 - Max entries: 100 (oldest trimmed on save)
 - Loaded at startup, saved after each `Add()`

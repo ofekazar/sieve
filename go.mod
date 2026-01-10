@@ -1,4 +1,4 @@
-module ofekazarya/cut
+module ofekazarya/sieve
 
 go 1.23.0
 

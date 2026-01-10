@@ -1,4 +1,4 @@
-# CUT
+# SIEVE
 
 An in-memory, AI slop, file viewer with powerful filtering capabilities for navigating large log files.
 
@@ -27,34 +27,34 @@ An in-memory, AI slop, file viewer with powerful filtering capabilities for navi
 Requires Go 1.18+
 
 ```bash
-git clone https://github.com/yourusername/cut.git
-cd cut
+git clone git@github.com:ofekazar/sieve.git
+cd sieve
 go build
 ```
 
-The binary will be created as `./cut`
+The binary will be created as `./sieve`
 
 ### Move to PATH (optional)
 
 ```bash
-sudo mv cut /usr/local/bin/
+sudo mv sieve /usr/local/bin/
 ```
 
 ## Usage
 
 ```bash
 # View a single file
-cut logfile.log
+sieve logfile.log
 
 # View multiple files (merged by timestamp)
-cut app1.log app2.log app3.log
+sieve app1.log app2.log app3.log
 
 # Follow mode (like tail -f)
-cut -f logfile.log
+sieve -f logfile.log
 
 # Read from stdin
-cat logfile.log | cut
-kubectl logs pod-name | cut
+cat logfile.log | sieve
+kubectl logs pod-name | sieve
 ```
 
 ## Keybindings
@@ -116,7 +116,7 @@ kubectl logs pod-name | cut
 
 ```
 # Open a large log file
-cut application.log
+sieve application.log
 
 # Press & and type "ERROR" to keep only error lines
 # Press - and type "timeout" to exclude timeout errors
@@ -128,7 +128,7 @@ cut application.log
 
 ```bash
 # View logs from multiple services, merged by timestamp
-cut frontend.log backend.log database.log
+sieve frontend.log backend.log database.log
 
 # Each line is prefixed with file index:
 # 0> 2024-01-15 10:00:01 Frontend request received

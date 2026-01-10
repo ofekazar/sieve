@@ -1307,7 +1307,7 @@ func NewApp(viewer *Viewer) *App {
 	return &App{
 		stack:   NewViewerStack(viewer),
 		search:  &SearchState{},
-		history: NewHistory("/tmp/cut_history"),
+		history: NewHistory("/tmp/sieve_history"),
 	}
 }
 
@@ -3083,9 +3083,9 @@ func main() {
 	versionFlag := flag.Bool("version", false, "Show version")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "cut - An in-memory file viewer with powerful filtering\n\n")
-		fmt.Fprintf(os.Stderr, "Usage: cut [OPTIONS] <filename> [filename2] [filename3] ...\n")
-		fmt.Fprintf(os.Stderr, "       command | cut\n\n")
+		fmt.Fprintf(os.Stderr, "sieve - An in-memory file viewer with powerful filtering\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: sieve [OPTIONS] <filename> [filename2] [filename3] ...\n")
+		fmt.Fprintf(os.Stderr, "       command | sieve\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  -f, --follow    Follow mode (like tail -f)\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help      Show this help message\n")
@@ -3101,7 +3101,7 @@ func main() {
 	}
 
 	if *versionFlag {
-		fmt.Printf("cut version %s\n", version)
+		fmt.Printf("sieve version %s\n", version)
 		os.Exit(0)
 	}
 
