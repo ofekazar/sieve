@@ -896,59 +896,139 @@ func (a *App) ShowTempMessage(msg string) {
 
 // ShowHelp displays the help screen
 func (a *App) ShowHelp() {
-	helpLines := []string{
-		"                    HELP - Press any key to close                    ",
-		"",
-		"  Navigation:",
-		"    j/↓         Move down one line",
-		"    k/↑         Move up one line",
-		"    h/←         Scroll left",
-		"    l/→         Scroll right",
-		"    g/Home      Go to start of file",
-		"    G/End       Go to end of file",
-		"    Space/PgDn  Page down",
-		"    PgUp        Page up",
-		"    :<number>   Go to line number",
-		"",
-		"  Search:",
-		"    /           Search forward",
-		"    ?           Search backward",
-		"    n           Next match",
-		"    N           Previous match",
-		"    Ctrl+R      Toggle regex mode (in search)",
-		"    Ctrl+I      Toggle case-insensitive (in search)",
-		"",
-		"  Filter:",
-		"    &           Keep lines matching pattern",
-		"    -           Exclude lines matching pattern",
-		"    +           Add lines matching pattern from original",
-		"    =           Reset to original file",
-		"    Ctrl+U      Go back one filter level",
-		"",
-		"  Other:",
-		"    w           Toggle word wrap",
-		"    H/F1        Show this help",
-		"    q/Esc       Quit",
+	type helpEntry struct {
+		key  string
+		desc string
+	}
+
+	sections := []struct {
+		title   string
+		entries []helpEntry
+	}{
+		{"Navigation", []helpEntry{
+			{"j / ↓", "Move down"},
+			{"k / ↑", "Move up"},
+			{"h / ←", "Scroll left"},
+			{"l / →", "Scroll right"},
+			{"g / Home", "Go to start"},
+			{"G / End", "Go to end"},
+			{"Space", "Page down"},
+			{"PgUp", "Page up"},
+			{":<num>", "Go to line"},
+		}},
+		{"Search", []helpEntry{
+			{"/", "Search forward"},
+			{"?", "Search backward"},
+			{"n / N", "Next / prev match"},
+			{"^R", "Toggle regex"},
+			{"^I", "Toggle case"},
+			{"↑ / ↓", "History"},
+		}},
+		{"Filter", []helpEntry{
+			{"&", "Keep matching"},
+			{"-", "Exclude matching"},
+			{"+", "Add from original"},
+			{"=", "Reset to original"},
+			{"^U", "Pop filter"},
+		}},
+		{"Other", []helpEntry{
+			{"w", "Toggle wrap"},
+			{"H / F1", "This help"},
+			{"q / Esc", "Quit"},
+		}},
 	}
 
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 	width, height := termbox.Size()
 
-	for y, line := range helpLines {
-		if y >= height-1 {
-			break
+	// Calculate box dimensions
+	boxWidth := 56
+	boxHeight := 24
+	startX := (width - boxWidth) / 2
+	startY := (height - boxHeight) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	if startY < 0 {
+		startY = 0
+	}
+
+	// Colors
+	borderFg := termbox.ColorCyan
+	titleFg := termbox.ColorYellow | termbox.AttrBold
+	sectionFg := termbox.ColorGreen | termbox.AttrBold
+	keyFg := termbox.ColorWhite | termbox.AttrBold
+	descFg := termbox.ColorDefault
+	bgColor := termbox.ColorDefault
+
+	// Draw border
+	drawBox := func(x, y, w, h int) {
+		// Corners
+		termbox.SetCell(x, y, '╭', borderFg, bgColor)
+		termbox.SetCell(x+w-1, y, '╮', borderFg, bgColor)
+		termbox.SetCell(x, y+h-1, '╰', borderFg, bgColor)
+		termbox.SetCell(x+w-1, y+h-1, '╯', borderFg, bgColor)
+		// Top and bottom
+		for i := 1; i < w-1; i++ {
+			termbox.SetCell(x+i, y, '─', borderFg, bgColor)
+			termbox.SetCell(x+i, y+h-1, '─', borderFg, bgColor)
 		}
-		x := (width - len(line)) / 2
-		if x < 0 {
-			x = 0
+		// Left and right
+		for i := 1; i < h-1; i++ {
+			termbox.SetCell(x, y+i, '│', borderFg, bgColor)
+			termbox.SetCell(x+w-1, y+i, '│', borderFg, bgColor)
 		}
-		for i, ch := range line {
-			if x+i >= width {
-				break
+		// Fill inside
+		for row := 1; row < h-1; row++ {
+			for col := 1; col < w-1; col++ {
+				termbox.SetCell(x+col, y+row, ' ', descFg, bgColor)
 			}
-			termbox.SetCell(x+i, y+1, ch, termbox.ColorDefault, termbox.ColorDefault)
 		}
 	}
+
+	drawText := func(x, y int, text string, fg termbox.Attribute) {
+		for i, ch := range text {
+			termbox.SetCell(x+i, y, ch, fg, bgColor)
+		}
+	}
+
+	drawBox(startX, startY, boxWidth, boxHeight)
+
+	// Title
+	title := " CUT - Help "
+	titleX := startX + (boxWidth-len(title))/2
+	drawText(titleX, startY, title, titleFg)
+
+	// Draw sections in two columns
+	y := startY + 2
+	col1X := startX + 2
+	col2X := startX + boxWidth/2
+
+	for i, section := range sections {
+		colX := col1X
+		if i >= 2 {
+			colX = col2X
+		}
+		if i == 2 {
+			y = startY + 2
+		}
+
+		drawText(colX, y, section.title, sectionFg)
+		y++
+
+		for _, entry := range section.entries {
+			drawText(colX, y, fmt.Sprintf("%-10s", entry.key), keyFg)
+			drawText(colX+11, y, entry.desc, descFg)
+			y++
+		}
+		y++
+	}
+
+	// Footer
+	footer := "Press any key to close"
+	footerX := startX + (boxWidth-len(footer))/2
+	drawText(footerX, startY+boxHeight-2, footer, termbox.ColorDefault|termbox.AttrDim)
+
 	termbox.Flush()
 
 	// Wait for any key
