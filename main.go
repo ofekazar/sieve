@@ -148,32 +148,33 @@ type ViewerStack struct {
 type App struct {
 	stack         *ViewerStack
 	search        *SearchState
-	filterHistory *FilterHistory
+	history       *History // Shared history for filters and searches
 	statusMessage string
 	messageExpiry time.Time
 }
 
-// FilterHistory manages persistent filter history
-type FilterHistory struct {
-	entries []string
-	index   int // Current position when navigating (-1 = new input)
+// History manages persistent command history (for filters and searches)
+type History struct {
+	entries   []string
+	index     int    // Current position when navigating (-1 = new input)
 	tempInput string // Store user input when navigating history
+	filename  string // File to persist history
 }
 
-const filterHistoryFile = "/tmp/cut_filter_history"
 const maxHistoryEntries = 100
 
-func NewFilterHistory() *FilterHistory {
-	h := &FilterHistory{
-		entries: []string{},
-		index:   -1,
+func NewHistory(filename string) *History {
+	h := &History{
+		entries:  []string{},
+		index:    -1,
+		filename: filename,
 	}
 	h.load()
 	return h
 }
 
-func (h *FilterHistory) load() {
-	data, err := os.ReadFile(filterHistoryFile)
+func (h *History) load() {
+	data, err := os.ReadFile(h.filename)
 	if err != nil {
 		return
 	}
@@ -185,17 +186,17 @@ func (h *FilterHistory) load() {
 	}
 }
 
-func (h *FilterHistory) save() {
+func (h *History) save() {
 	// Keep only the last maxHistoryEntries
 	start := 0
 	if len(h.entries) > maxHistoryEntries {
 		start = len(h.entries) - maxHistoryEntries
 	}
 	data := strings.Join(h.entries[start:], "\n")
-	os.WriteFile(filterHistoryFile, []byte(data), 0644)
+	os.WriteFile(h.filename, []byte(data), 0644)
 }
 
-func (h *FilterHistory) Add(entry string) {
+func (h *History) Add(entry string) {
 	if entry == "" {
 		return
 	}
@@ -207,12 +208,12 @@ func (h *FilterHistory) Add(entry string) {
 	h.save()
 }
 
-func (h *FilterHistory) Reset() {
+func (h *History) Reset() {
 	h.index = -1
 	h.tempInput = ""
 }
 
-func (h *FilterHistory) Up(currentInput string) string {
+func (h *History) Up(currentInput string) string {
 	if len(h.entries) == 0 {
 		return currentInput
 	}
@@ -225,7 +226,7 @@ func (h *FilterHistory) Up(currentInput string) string {
 	return h.entries[h.index]
 }
 
-func (h *FilterHistory) Down(currentInput string) string {
+func (h *History) Down(currentInput string) string {
 	if h.index == -1 {
 		return currentInput
 	}
@@ -672,9 +673,11 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 	}
 }
 
-// promptForSearch prompts for search input with regex (Ctrl+R) and case (Ctrl+I) toggles
+// promptForSearch prompts for search input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
 // Returns: input string, isRegex flag, ignoreCase flag, ok
-func (v *Viewer) promptForSearch(prompt string) (string, bool, bool, bool) {
+func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
+	v := a.stack.Current()
+	a.history.Reset()
 	input := ""
 	isRegex := false
 	ignoreCase := false
@@ -723,6 +726,9 @@ func (v *Viewer) promptForSearch(prompt string) (string, bool, bool, bool) {
 		case termbox.EventKey:
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
+				if input != "" {
+					a.history.Add(input)
+				}
 				return input, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
 				termbox.HideCursor()
@@ -732,6 +738,10 @@ func (v *Viewer) promptForSearch(prompt string) (string, bool, bool, bool) {
 					runes := []rune(input)
 					input = string(runes[:len(runes)-1])
 				}
+			} else if ev.Key == termbox.KeyArrowUp {
+				input = a.history.Up(input)
+			} else if ev.Key == termbox.KeyArrowDown {
+				input = a.history.Down(input)
 			} else if ev.Key == termbox.KeyCtrlR {
 				isRegex = !isRegex
 			} else if ev.Key == termbox.KeyCtrlI {
@@ -801,16 +811,16 @@ func (s *ViewerStack) Reset() bool {
 // NewApp creates a new App with the given viewer
 func NewApp(viewer *Viewer) *App {
 	return &App{
-		stack:         NewViewerStack(viewer),
-		search:        &SearchState{},
-		filterHistory: NewFilterHistory(),
+		stack:   NewViewerStack(viewer),
+		search:  &SearchState{},
+		history: NewHistory("/tmp/cut_history"),
 	}
 }
 
 // promptForFilter prompts for filter input with history navigation (up/down arrows)
 func (a *App) promptForFilter(prompt string) (string, bool) {
 	v := a.stack.Current()
-	a.filterHistory.Reset()
+	a.history.Reset()
 	input := ""
 
 	for {
@@ -838,7 +848,7 @@ func (a *App) promptForFilter(prompt string) (string, bool) {
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
 				if input != "" {
-					a.filterHistory.Add(input)
+					a.history.Add(input)
 				}
 				return input, true
 			} else if ev.Key == termbox.KeyEsc {
@@ -850,9 +860,9 @@ func (a *App) promptForFilter(prompt string) (string, bool) {
 					input = string(runes[:len(runes)-1])
 				}
 			} else if ev.Key == termbox.KeyArrowUp {
-				input = a.filterHistory.Up(input)
+				input = a.history.Up(input)
 			} else if ev.Key == termbox.KeyArrowDown {
-				input = a.filterHistory.Down(input)
+				input = a.history.Down(input)
 			} else if ev.Ch != 0 {
 				input += string(ev.Ch)
 			} else if ev.Key == termbox.KeySpace {
@@ -1231,7 +1241,7 @@ func (a *App) HandleSearch(backward bool) {
 		noMatchMsg = "BOF - no more matches"
 	}
 
-	query, isRegex, ignoreCase, ok := current.promptForSearch(prompt)
+	query, isRegex, ignoreCase, ok := a.promptForSearch(prompt)
 	if ok && query != "" {
 		lines := current.GetLines()
 		lineIdx := a.search.Search(lines, query, current.topLine, backward, isRegex, ignoreCase)
