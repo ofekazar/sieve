@@ -946,6 +946,8 @@ func (a *App) Draw() {
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
 	lineCount := current.LineCount()
+	searchQuery := a.search.query
+
 	for screenY := 0; screenY < current.height; screenY++ {
 		lineIndex := current.topLine + screenY
 		if lineIndex >= lineCount {
@@ -953,6 +955,33 @@ func (a *App) Draw() {
 		}
 		line := current.GetLine(lineIndex)
 		cells := parseANSI(line)
+
+		// Find search match positions in this line (on the raw text without ANSI)
+		var matchPositions []bool
+		if searchQuery != "" {
+			matchPositions = make([]bool, len(cells))
+			// Strip ANSI for search matching
+			plainText := make([]rune, len(cells))
+			for i, c := range cells {
+				plainText[i] = c.char
+			}
+			plainStr := string(plainText)
+			searchIdx := 0
+			for {
+				idx := strings.Index(plainStr[searchIdx:], searchQuery)
+				if idx == -1 {
+					break
+				}
+				matchStart := searchIdx + idx
+				for j := 0; j < len(searchQuery); j++ {
+					if matchStart+j < len(matchPositions) {
+						matchPositions[matchStart+j] = true
+					}
+				}
+				searchIdx = matchStart + 1
+			}
+		}
+
 		screenX := 0
 		for i, cell := range cells {
 			if i < current.leftCol {
@@ -961,7 +990,13 @@ func (a *App) Draw() {
 			if screenX >= current.width {
 				break
 			}
-			termbox.SetCell(screenX, screenY, cell.char, cell.fg, cell.bg)
+			fg, bg := cell.fg, cell.bg
+			// Highlight search matches
+			if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
+				fg = termbox.ColorBlack
+				bg = termbox.ColorYellow
+			}
+			termbox.SetCell(screenX, screenY, cell.char, fg, bg)
 			screenX++
 		}
 	}
