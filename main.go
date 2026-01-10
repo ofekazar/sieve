@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -514,46 +515,68 @@ func NewViewer(filename string) (*Viewer, error) {
 	// Load file in background with batched updates for performance
 	go func() {
 		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		buf := make([]byte, 0, 64*1024)
-		scanner.Buffer(buf, 10*1024*1024)
-
-		const batchSize = 10000
-		batch := make([]string, 0, batchSize)
-		totalLines := 0
-
-		for scanner.Scan() {
-			batch = append(batch, scanner.Text())
-
-			if len(batch) >= batchSize {
-				v.mu.Lock()
-				v.lines = append(v.lines, batch...)
-				v.mu.Unlock()
-				totalLines += len(batch)
-				batch = batch[:0]
-
-				// Only interrupt for first batch (to show content quickly) and then sparingly
-				if totalLines == batchSize || totalLines%100000 == 0 {
-					termbox.Interrupt()
-				}
-			}
-		}
-
-		// Append remaining lines
-		if len(batch) > 0 {
-			v.mu.Lock()
-			v.lines = append(v.lines, batch...)
-			v.mu.Unlock()
-		}
-
-		v.mu.Lock()
-		v.loading = false
-		v.mu.Unlock()
-		termbox.Interrupt()
+		loadFromReader(v, file)
 	}()
 
 	return v, nil
+}
+
+// NewViewerFromStdin creates a Viewer that reads from stdin
+func NewViewerFromStdin() *Viewer {
+	v := &Viewer{
+		lines:    nil,
+		loading:  true,
+		filename: "<stdin>",
+		topLine:  0,
+		leftCol:  0,
+	}
+
+	// Load stdin in background
+	go func() {
+		loadFromReader(v, os.Stdin)
+	}()
+
+	return v
+}
+
+// loadFromReader loads lines from an io.Reader into a Viewer
+func loadFromReader(v *Viewer, r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	const batchSize = 10000
+	batch := make([]string, 0, batchSize)
+	totalLines := 0
+
+	for scanner.Scan() {
+		batch = append(batch, scanner.Text())
+
+		if len(batch) >= batchSize {
+			v.mu.Lock()
+			v.lines = append(v.lines, batch...)
+			v.mu.Unlock()
+			totalLines += len(batch)
+			batch = batch[:0]
+
+			// Only interrupt for first batch (to show content quickly) and then sparingly
+			if totalLines == batchSize || totalLines%100000 == 0 {
+				termbox.Interrupt()
+			}
+		}
+	}
+
+	// Append remaining lines
+	if len(batch) > 0 {
+		v.mu.Lock()
+		v.lines = append(v.lines, batch...)
+		v.mu.Unlock()
+	}
+
+	v.mu.Lock()
+	v.loading = false
+	v.mu.Unlock()
+	termbox.Interrupt()
 }
 
 // NewViewerFromLines creates a Viewer from an existing slice of lines
@@ -2120,14 +2143,24 @@ func (v *Viewer) run() error {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: cut <filename>")
-		os.Exit(1)
-	}
+	var viewer *Viewer
+	var err error
 
-	viewer, err := NewViewer(os.Args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
+	// Check if data is being piped via stdin
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// stdin has data (pipe or redirect)
+		viewer = NewViewerFromStdin()
+	} else if len(os.Args) >= 2 {
+		// Read from file
+		viewer, err = NewViewer(os.Args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("Usage: cut <filename>")
+		fmt.Println("       command | cut")
 		os.Exit(1)
 	}
 
