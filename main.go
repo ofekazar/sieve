@@ -1383,12 +1383,15 @@ func pythonToGoFormat(pyFormat string) string {
 
 // Common timestamp formats to try for auto-detection
 var commonTimestampFormats = []string{
+	// More specific formats first (with microseconds/milliseconds)
+	"%Y-%m-%d %H:%M:%S.%f", // 2026-01-06 15:48:10.192158
+	"%Y-%m-%dT%H:%M:%S.%f", // 2026-01-06T15:48:10.192158
+	// Standard formats
 	"%Y-%m-%d %H:%M:%S",
 	"%Y-%m-%dT%H:%M:%S",
 	"%Y/%m/%d %H:%M:%S",
 	"%d/%m/%Y %H:%M:%S",
 	"%m/%d/%Y %H:%M:%S",
-	"%Y-%m-%d %H:%M:%S.%f",
 	"%H:%M:%S",
 	"%Y%m%d%H%M%S",
 	"[%Y-%m-%d %H:%M:%S]",
@@ -2653,6 +2656,173 @@ func (v *Viewer) run() error {
 	}
 }
 
+// fileStream represents an open file with its current line buffered
+type fileStream struct {
+	scanner   *bufio.Scanner
+	file      *os.File
+	fileIdx   int
+	prefix    string
+	currLine  string
+	currTime  time.Time
+	hasTime   bool
+	exhausted bool
+}
+
+// NewViewerFromMultipleFiles creates a viewer by streaming and merging multiple files by timestamp
+func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
+	if len(filenames) == 0 {
+		return nil, fmt.Errorf("no files provided")
+	}
+	if len(filenames) == 1 {
+		return NewViewer(filenames[0])
+	}
+
+	// Build filename legend
+	var legend []string
+	for i, name := range filenames {
+		legend = append(legend, fmt.Sprintf("%d> %s", i, name))
+	}
+	legendStr := strings.Join(legend, " ")
+
+	v := &Viewer{
+		lines:    nil,
+		loading:  true,
+		filename: legendStr,
+		topLine:  0,
+		leftCol:  0,
+	}
+
+	go func() {
+		// Open all files and create streams
+		var streams []*fileStream
+		var detectedFormat string
+
+		for fileIdx, filename := range filenames {
+			file, err := os.Open(filename)
+			if err != nil {
+				continue
+			}
+
+			scanner := bufio.NewScanner(file)
+			buf := make([]byte, 0, 64*1024)
+			scanner.Buffer(buf, 10*1024*1024)
+
+			stream := &fileStream{
+				scanner: scanner,
+				file:    file,
+				fileIdx: fileIdx,
+				prefix:  fmt.Sprintf("%d> ", fileIdx),
+			}
+
+			// Read first line to prime the stream
+			if scanner.Scan() {
+				line := scanner.Text()
+				stream.currLine = stream.prefix + line
+
+				// Try to detect format from first line if not set
+				if detectedFormat == "" {
+					detectedFormat = detectTimestampFormat(line)
+				}
+
+				// Parse timestamp
+				if detectedFormat != "" {
+					if ts, ok := extractTimestamp(line, detectedFormat); ok {
+						stream.currTime = ts
+						stream.hasTime = true
+					}
+				}
+			} else {
+				stream.exhausted = true
+				file.Close()
+			}
+
+			streams = append(streams, stream)
+		}
+
+		// K-way merge: always pick the stream with the oldest timestamp
+		const batchSize = 10000
+		batch := make([]string, 0, batchSize)
+		totalLines := 0
+
+		for {
+			// Find stream to pick: prioritize lines without timestamps, then oldest timestamp
+			var picked *fileStream
+			for _, s := range streams {
+				if s.exhausted {
+					continue
+				}
+				if picked == nil {
+					picked = s
+				} else if !s.hasTime && picked.hasTime {
+					// Lines without timestamp are output immediately (priority)
+					picked = s
+				} else if s.hasTime && !picked.hasTime {
+					// Keep the one without timestamp (it has priority)
+					// picked stays
+				} else if s.hasTime && picked.hasTime {
+					// Both have timestamps: pick the oldest
+					if s.currTime.Before(picked.currTime) {
+						picked = s
+					}
+				}
+				// If neither has timestamp, keep first found (preserve order)
+			}
+
+			// All streams exhausted
+			if picked == nil {
+				break
+			}
+
+			// Add the picked line to batch
+			batch = append(batch, picked.currLine)
+
+			// Advance that stream to its next line
+			if picked.scanner.Scan() {
+				line := picked.scanner.Text()
+				picked.currLine = picked.prefix + line
+				picked.hasTime = false
+
+				if detectedFormat != "" {
+					if ts, ok := extractTimestamp(line, detectedFormat); ok {
+						picked.currTime = ts
+						picked.hasTime = true
+					}
+				}
+			} else {
+				picked.exhausted = true
+				picked.file.Close()
+			}
+
+			// Flush batch periodically
+			if len(batch) >= batchSize {
+				v.mu.Lock()
+				v.lines = append(v.lines, batch...)
+				v.mu.Unlock()
+				totalLines += len(batch)
+				batch = batch[:0]
+
+				if totalLines == batchSize || totalLines%100000 == 0 {
+					termbox.Interrupt()
+				}
+			}
+		}
+
+		// Append remaining
+		if len(batch) > 0 {
+			v.mu.Lock()
+			v.lines = append(v.lines, batch...)
+			v.mu.Unlock()
+		}
+
+		v.mu.Lock()
+		v.loading = false
+		v.mu.Unlock()
+		termbox.Interrupt()
+	}()
+
+	return v, nil
+}
+
 func main() {
 	var viewer *Viewer
 	var err error
@@ -2662,15 +2832,22 @@ func main() {
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		// stdin has data (pipe or redirect)
 		viewer = NewViewerFromStdin()
+	} else if len(os.Args) >= 3 {
+		// Multiple files - merge sort by timestamp
+		viewer, err = NewViewerFromMultipleFiles(os.Args[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading files: %v\n", err)
+			os.Exit(1)
+		}
 	} else if len(os.Args) >= 2 {
-		// Read from file
+		// Single file
 		viewer, err = NewViewer(os.Args[1])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
-		fmt.Println("Usage: cut <filename>")
+		fmt.Println("Usage: cut <filename> [filename2] [filename3] ...")
 		fmt.Println("       command | cut")
 		os.Exit(1)
 	}
