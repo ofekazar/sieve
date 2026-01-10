@@ -146,8 +146,93 @@ type ViewerStack struct {
 type App struct {
 	stack         *ViewerStack
 	search        *SearchState
+	filterHistory *FilterHistory
 	statusMessage string
 	messageExpiry time.Time
+}
+
+// FilterHistory manages persistent filter history
+type FilterHistory struct {
+	entries []string
+	index   int // Current position when navigating (-1 = new input)
+	tempInput string // Store user input when navigating history
+}
+
+const filterHistoryFile = "/tmp/cut_filter_history"
+const maxHistoryEntries = 100
+
+func NewFilterHistory() *FilterHistory {
+	h := &FilterHistory{
+		entries: []string{},
+		index:   -1,
+	}
+	h.load()
+	return h
+}
+
+func (h *FilterHistory) load() {
+	data, err := os.ReadFile(filterHistoryFile)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line != "" {
+			h.entries = append(h.entries, line)
+		}
+	}
+}
+
+func (h *FilterHistory) save() {
+	// Keep only the last maxHistoryEntries
+	start := 0
+	if len(h.entries) > maxHistoryEntries {
+		start = len(h.entries) - maxHistoryEntries
+	}
+	data := strings.Join(h.entries[start:], "\n")
+	os.WriteFile(filterHistoryFile, []byte(data), 0644)
+}
+
+func (h *FilterHistory) Add(entry string) {
+	if entry == "" {
+		return
+	}
+	// Don't add duplicates in a row
+	if len(h.entries) > 0 && h.entries[len(h.entries)-1] == entry {
+		return
+	}
+	h.entries = append(h.entries, entry)
+	h.save()
+}
+
+func (h *FilterHistory) Reset() {
+	h.index = -1
+	h.tempInput = ""
+}
+
+func (h *FilterHistory) Up(currentInput string) string {
+	if len(h.entries) == 0 {
+		return currentInput
+	}
+	if h.index == -1 {
+		h.tempInput = currentInput
+		h.index = len(h.entries) - 1
+	} else if h.index > 0 {
+		h.index--
+	}
+	return h.entries[h.index]
+}
+
+func (h *FilterHistory) Down(currentInput string) string {
+	if h.index == -1 {
+		return currentInput
+	}
+	h.index++
+	if h.index >= len(h.entries) {
+		h.index = -1
+		return h.tempInput
+	}
+	return h.entries[h.index]
 }
 
 // SearchState holds the current search results
@@ -696,8 +781,68 @@ func (s *ViewerStack) Reset() bool {
 // NewApp creates a new App with the given viewer
 func NewApp(viewer *Viewer) *App {
 	return &App{
-		stack:  NewViewerStack(viewer),
-		search: &SearchState{},
+		stack:         NewViewerStack(viewer),
+		search:        &SearchState{},
+		filterHistory: NewFilterHistory(),
+	}
+}
+
+// promptForFilter prompts for filter input with history navigation (up/down arrows)
+func (a *App) promptForFilter(prompt string) (string, bool) {
+	v := a.stack.Current()
+	a.filterHistory.Reset()
+	input := ""
+
+	for {
+		statusY := v.height
+		line := prompt + input
+
+		for i := 0; i < v.width; i++ {
+			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+		}
+		for i, char := range line {
+			if i >= v.width {
+				break
+			}
+			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+		}
+		cursorPos := len([]rune(line))
+		if cursorPos < v.width {
+			termbox.SetCursor(cursorPos, statusY)
+		}
+		termbox.Flush()
+
+		ev := termbox.PollEvent()
+		switch ev.Type {
+		case termbox.EventKey:
+			if ev.Key == termbox.KeyEnter {
+				termbox.HideCursor()
+				if input != "" {
+					a.filterHistory.Add(input)
+				}
+				return input, true
+			} else if ev.Key == termbox.KeyEsc {
+				termbox.HideCursor()
+				return "", false
+			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
+				if len(input) > 0 {
+					runes := []rune(input)
+					input = string(runes[:len(runes)-1])
+				}
+			} else if ev.Key == termbox.KeyArrowUp {
+				input = a.filterHistory.Up(input)
+			} else if ev.Key == termbox.KeyArrowDown {
+				input = a.filterHistory.Down(input)
+			} else if ev.Ch != 0 {
+				input += string(ev.Ch)
+			} else if ev.Key == termbox.KeySpace {
+				input += " "
+			}
+		case termbox.EventResize:
+			termbox.Sync()
+			v.resize(ev.Width, ev.Height)
+			v.draw()
+		}
 	}
 }
 
@@ -800,7 +945,7 @@ func (a *App) HandleFilter(keep bool) {
 		prompt = "-"
 	}
 
-	query, ok := current.promptForInput(prompt)
+	query, ok := a.promptForFilter(prompt)
 	if ok && query != "" {
 		lines := current.GetLines() // Get snapshot for thread-safety
 
@@ -912,7 +1057,7 @@ func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
 	currentLine := current.GetLine(current.topLine)
 
-	query, ok := current.promptForInput("+")
+	query, ok := a.promptForFilter("+")
 	if ok && query != "" {
 		original := a.stack.viewers[0]
 		currentLines := current.GetLines()
