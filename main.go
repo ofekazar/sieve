@@ -316,7 +316,7 @@ func (v *Viewer) navigateUp() {
 }
 
 func (v *Viewer) navigateDown() {
-	maxTop := v.LineCount() - 2
+	maxTop := v.LineCount() - 1
 	if maxTop < 0 {
 		maxTop = 0
 	}
@@ -340,7 +340,7 @@ func (v *Viewer) navigateRight(amount int) {
 func (v *Viewer) pageDown() {
 	v.topLine += v.height
 	// Allow scrolling until last line is at top
-	maxTop := v.LineCount() - 2
+	maxTop := v.LineCount() - 1
 	if maxTop < 0 {
 		maxTop = 0
 	}
@@ -362,7 +362,7 @@ func (v *Viewer) goToStart() {
 
 func (v *Viewer) goToEnd() {
 	// Go to last line at top
-	v.topLine = v.LineCount() - 2
+	v.topLine = v.LineCount() - 1
 	if v.topLine < 0 {
 		v.topLine = 0
 	}
@@ -516,32 +516,52 @@ func (a *App) HandleFilter(keep bool) {
 	query, ok := current.promptForInput(prompt)
 	if ok && query != "" {
 		lines := current.GetLines() // Get snapshot for thread-safety
-		filtered := filterLinesSlice(lines, query, keep)
-		if len(filtered) > 0 {
-			newViewer := NewViewerFromLines(filtered)
 
-			// Find the first remaining line at or after currentTopLine
-			// Count how many remaining lines appear before it to get new position
+		// Create new viewer immediately with loading state
+		newViewer := &Viewer{
+			lines:   nil,
+			loading: true,
+			topLine: 0,
+			leftCol: 0,
+		}
+		a.stack.Push(newViewer)
+		a.search.Clear()
+
+		// Filter in background
+		go func() {
 			matchesBefore := 0
 			foundMatch := false
-			for i := 0; i < len(lines); i++ {
-				matches := strings.Contains(lines[i], query)
+			lineCount := 0
+
+			for i, line := range lines {
+				matches := strings.Contains(line, query)
 				if matches == keep {
+					newViewer.mu.Lock()
+					newViewer.lines = append(newViewer.lines, line)
+					newViewer.mu.Unlock()
+
+					// Track position for cursor placement
 					if i >= currentTopLine && !foundMatch {
 						foundMatch = true
-						break
+						newViewer.topLine = matchesBefore
 					}
-					matchesBefore++
+					if !foundMatch {
+						matchesBefore++
+					}
+
+					lineCount++
+					// Trigger redraw periodically
+					if lineCount <= 100 || lineCount%1000 == 0 {
+						termbox.Interrupt()
+					}
 				}
 			}
 
-			if foundMatch {
-				newViewer.topLine = matchesBefore
-			}
-
-			a.stack.Push(newViewer)
-			a.search.Clear()
-		}
+			newViewer.mu.Lock()
+			newViewer.loading = false
+			newViewer.mu.Unlock()
+			termbox.Interrupt()
+		}()
 	}
 }
 
@@ -556,37 +576,58 @@ func (a *App) HandleFilterAppend() {
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
 
-		currentCounts := make(map[string]int)
-		for _, line := range currentLines {
-			currentCounts[line]++
+		// Create new viewer immediately with loading state
+		newViewer := &Viewer{
+			lines:   nil,
+			loading: true,
+			topLine: 0,
+			leftCol: 0,
 		}
+		a.stack.Push(newViewer)
+		a.search.Clear()
 
-		var combined []string
-		for _, line := range originalLines {
-			if currentCounts[line] > 0 {
-				combined = append(combined, line)
-				currentCounts[line]--
-			} else if strings.Contains(line, query) {
-				combined = append(combined, line)
+		// Process in background
+		go func() {
+			currentCounts := make(map[string]int)
+			for _, line := range currentLines {
+				currentCounts[line]++
 			}
-		}
 
-		if len(combined) > 0 {
-			newViewer := NewViewerFromLines(combined)
+			lineCount := 0
+			foundCurrentLine := false
 
-			// Find the current line in the combined result to stay on the same line
-			if currentLine != "" {
-				for i, line := range combined {
-					if line == currentLine {
-						newViewer.topLine = i
-						break
+			for _, line := range originalLines {
+				include := false
+				if currentCounts[line] > 0 {
+					include = true
+					currentCounts[line]--
+				} else if strings.Contains(line, query) {
+					include = true
+				}
+
+				if include {
+					newViewer.mu.Lock()
+					newViewer.lines = append(newViewer.lines, line)
+					// Track position for cursor placement
+					if !foundCurrentLine && line == currentLine {
+						foundCurrentLine = true
+						newViewer.topLine = len(newViewer.lines) - 1
+					}
+					newViewer.mu.Unlock()
+
+					lineCount++
+					// Trigger redraw periodically
+					if lineCount <= 100 || lineCount%1000 == 0 {
+						termbox.Interrupt()
 					}
 				}
 			}
 
-			a.stack.Push(newViewer)
-			a.search.Clear()
-		}
+			newViewer.mu.Lock()
+			newViewer.loading = false
+			newViewer.mu.Unlock()
+			termbox.Interrupt()
+		}()
 	}
 }
 
@@ -733,9 +774,9 @@ func (v *Viewer) run() error {
 				case 'k':
 					current.navigateUp()
 				case 'h':
-					current.navigateLeft(current.width / 3)
+					current.navigateLeft(current.width / 4)
 				case 'l':
-					current.navigateRight(current.width / 3)
+					current.navigateRight(current.width / 4)
 				case 'g':
 					current.goToStart()
 				case 'G':
@@ -768,9 +809,9 @@ func (v *Viewer) run() error {
 				case termbox.KeyArrowDown:
 					current.navigateDown()
 				case termbox.KeyArrowLeft:
-					current.navigateLeft(current.width / 3)
+					current.navigateLeft(current.width / 4)
 				case termbox.KeyArrowRight:
-					current.navigateRight(current.width / 3)
+					current.navigateRight(current.width / 4)
 				case termbox.KeyPgdn, termbox.KeySpace:
 					current.pageDown()
 				case termbox.KeyPgup:
