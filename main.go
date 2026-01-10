@@ -502,6 +502,13 @@ func (a *App) ClearMessage() {
 	a.statusMessage = ""
 }
 
+// filterChunkResult holds the result of filtering a chunk
+type filterChunkResult struct {
+	chunkIdx int
+	lines    []string
+	indices  []int // Original line indices
+}
+
 // HandleFilter filters lines based on query
 // If keep is true (&), keeps matching lines; if false (-), excludes matching lines
 func (a *App) HandleFilter(keep bool) {
@@ -527,21 +534,77 @@ func (a *App) HandleFilter(keep bool) {
 		a.stack.Push(newViewer)
 		a.search.Clear()
 
-		// Filter in background
+		// Filter in parallel
 		go func() {
-			matchesBefore := 0
+			numWorkers := 8
+			totalLines := len(lines)
+			if totalLines < numWorkers {
+				numWorkers = 1
+			}
+			chunkSize := (totalLines + numWorkers - 1) / numWorkers
+
+			resultChan := make(chan filterChunkResult, numWorkers)
+
+			// Start workers
+			for w := 0; w < numWorkers; w++ {
+				start := w * chunkSize
+				end := start + chunkSize
+				if end > totalLines {
+					end = totalLines
+				}
+				if start >= totalLines {
+					break
+				}
+
+				go func(chunkIdx, start, end int) {
+					var chunkLines []string
+					var chunkIndices []int
+					for i := start; i < end; i++ {
+						matches := strings.Contains(lines[i], query)
+						if matches == keep {
+							chunkLines = append(chunkLines, lines[i])
+							chunkIndices = append(chunkIndices, i)
+						}
+					}
+					resultChan <- filterChunkResult{chunkIdx, chunkLines, chunkIndices}
+				}(w, start, end)
+			}
+
+			// Collect results in order
+			results := make([]filterChunkResult, numWorkers)
+			received := 0
+			expectedWorkers := numWorkers
+			if totalLines < numWorkers {
+				expectedWorkers = 1
+			}
+			for i := 0; i < expectedWorkers && received < numWorkers; i++ {
+				result := <-resultChan
+				results[result.chunkIdx] = result
+				received++
+				if result.chunkIdx >= expectedWorkers {
+					break
+				}
+			}
+			close(resultChan)
+
+			// Drain any remaining
+			for range resultChan {
+			}
+
+			// Merge results in order and stream to viewer
 			foundMatch := false
+			matchesBefore := 0
 			lineCount := 0
 
-			for i, line := range lines {
-				matches := strings.Contains(line, query)
-				if matches == keep {
+			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
+				chunk := results[chunkIdx]
+				for j, line := range chunk.lines {
 					newViewer.mu.Lock()
 					newViewer.lines = append(newViewer.lines, line)
 					newViewer.mu.Unlock()
 
-					// Track position for cursor placement
-					if i >= currentTopLine && !foundMatch {
+					origIdx := chunk.indices[j]
+					if origIdx >= currentTopLine && !foundMatch {
 						foundMatch = true
 						newViewer.topLine = matchesBefore
 					}
@@ -550,7 +613,6 @@ func (a *App) HandleFilter(keep bool) {
 					}
 
 					lineCount++
-					// Trigger redraw periodically
 					if lineCount <= 100 || lineCount%1000 == 0 {
 						termbox.Interrupt()
 					}
@@ -586,29 +648,87 @@ func (a *App) HandleFilterAppend() {
 		a.stack.Push(newViewer)
 		a.search.Clear()
 
-		// Process in background
+		// Process in parallel
 		go func() {
+			// Build current counts map (sequential - usually small)
 			currentCounts := make(map[string]int)
 			for _, line := range currentLines {
 				currentCounts[line]++
 			}
 
-			lineCount := 0
-			foundCurrentLine := false
+			// Parallel filtering of original lines
+			numWorkers := 8
+			totalLines := len(originalLines)
+			if totalLines < numWorkers {
+				numWorkers = 1
+			}
+			chunkSize := (totalLines + numWorkers - 1) / numWorkers
 
-			for _, line := range originalLines {
-				include := false
-				if currentCounts[line] > 0 {
-					include = true
-					currentCounts[line]--
-				} else if strings.Contains(line, query) {
-					include = true
+			// For append, we need to track which current lines are used per chunk
+			// Each worker gets its own copy of counts for the lines in its chunk
+			type appendChunkResult struct {
+				chunkIdx int
+				lines    []string
+			}
+			resultChan := make(chan appendChunkResult, numWorkers)
+
+			// Pre-calculate which original lines match current lines (need order)
+			// First, mark lines that are in current
+			inCurrent := make([]bool, totalLines)
+			tempCounts := make(map[string]int)
+			for k, v := range currentCounts {
+				tempCounts[k] = v
+			}
+			for i, line := range originalLines {
+				if tempCounts[line] > 0 {
+					inCurrent[i] = true
+					tempCounts[line]--
+				}
+			}
+
+			// Start workers - each checks if line is in current OR matches query
+			for w := 0; w < numWorkers; w++ {
+				start := w * chunkSize
+				end := start + chunkSize
+				if end > totalLines {
+					end = totalLines
+				}
+				if start >= totalLines {
+					break
 				}
 
-				if include {
+				go func(chunkIdx, start, end int) {
+					var chunkLines []string
+					for i := start; i < end; i++ {
+						if inCurrent[i] || strings.Contains(originalLines[i], query) {
+							chunkLines = append(chunkLines, originalLines[i])
+						}
+					}
+					resultChan <- appendChunkResult{chunkIdx, chunkLines}
+				}(w, start, end)
+			}
+
+			// Collect results in order
+			results := make([]appendChunkResult, numWorkers)
+			expectedWorkers := numWorkers
+			if totalLines < numWorkers {
+				expectedWorkers = 1
+			}
+			for i := 0; i < expectedWorkers; i++ {
+				result := <-resultChan
+				results[result.chunkIdx] = result
+			}
+			close(resultChan)
+
+			// Merge results in order and stream to viewer
+			foundCurrentLine := false
+			lineCount := 0
+
+			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
+				chunk := results[chunkIdx]
+				for _, line := range chunk.lines {
 					newViewer.mu.Lock()
 					newViewer.lines = append(newViewer.lines, line)
-					// Track position for cursor placement
 					if !foundCurrentLine && line == currentLine {
 						foundCurrentLine = true
 						newViewer.topLine = len(newViewer.lines) - 1
@@ -616,7 +736,6 @@ func (a *App) HandleFilterAppend() {
 					newViewer.mu.Unlock()
 
 					lineCount++
-					// Trigger redraw periodically
 					if lineCount <= 100 || lineCount%1000 == 0 {
 						termbox.Interrupt()
 					}
