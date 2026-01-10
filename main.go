@@ -398,10 +398,48 @@ func (h *History) save() {
 	os.WriteFile(h.filename, []byte(data), 0644)
 }
 
+// encodeHistoryEntry encodes query with modifiers as "RI|query" where R=r/-, I=i/-
+func encodeHistoryEntry(query string, isRegex, ignoreCase bool) string {
+	r := "-"
+	if isRegex {
+		r = "r"
+	}
+	i := "-"
+	if ignoreCase {
+		i = "i"
+	}
+	return r + i + "|" + query
+}
+
+// decodeHistoryEntry decodes "RI|query" into query, isRegex, ignoreCase
+func decodeHistoryEntry(entry string) (string, bool, bool) {
+	if len(entry) >= 3 && entry[2] == '|' {
+		isRegex := entry[0] == 'r'
+		ignoreCase := entry[1] == 'i'
+		return entry[3:], isRegex, ignoreCase
+	}
+	// Legacy entry without modifiers
+	return entry, false, false
+}
+
 func (h *History) Add(entry string) {
 	if entry == "" {
 		return
 	}
+	// Don't add duplicates in a row
+	if len(h.entries) > 0 && h.entries[len(h.entries)-1] == entry {
+		return
+	}
+	h.entries = append(h.entries, entry)
+	h.save()
+}
+
+// AddWithModifiers adds entry with regex and ignoreCase flags encoded
+func (h *History) AddWithModifiers(query string, isRegex, ignoreCase bool) {
+	if query == "" {
+		return
+	}
+	entry := encodeHistoryEntry(query, isRegex, ignoreCase)
 	// Don't add duplicates in a row
 	if len(h.entries) > 0 && h.entries[len(h.entries)-1] == entry {
 		return
@@ -428,6 +466,20 @@ func (h *History) Up(currentInput string) string {
 	return h.entries[h.index]
 }
 
+// UpWithModifiers returns query, isRegex, ignoreCase from history
+func (h *History) UpWithModifiers(currentInput string, currentRegex, currentIgnoreCase bool) (string, bool, bool) {
+	if len(h.entries) == 0 {
+		return currentInput, currentRegex, currentIgnoreCase
+	}
+	if h.index == -1 {
+		h.tempInput = encodeHistoryEntry(currentInput, currentRegex, currentIgnoreCase)
+		h.index = len(h.entries) - 1
+	} else if h.index > 0 {
+		h.index--
+	}
+	return decodeHistoryEntry(h.entries[h.index])
+}
+
 func (h *History) Down(currentInput string) string {
 	if h.index == -1 {
 		return currentInput
@@ -438,6 +490,19 @@ func (h *History) Down(currentInput string) string {
 		return h.tempInput
 	}
 	return h.entries[h.index]
+}
+
+// DownWithModifiers returns query, isRegex, ignoreCase from history
+func (h *History) DownWithModifiers(currentInput string, currentRegex, currentIgnoreCase bool) (string, bool, bool) {
+	if h.index == -1 {
+		return currentInput, currentRegex, currentIgnoreCase
+	}
+	h.index++
+	if h.index >= len(h.entries) {
+		h.index = -1
+		return decodeHistoryEntry(h.tempInput)
+	}
+	return decodeHistoryEntry(h.entries[h.index])
 }
 
 // SearchState holds the current search results
@@ -1156,7 +1221,7 @@ func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
 				if input != "" {
-					a.history.Add(input)
+					a.history.AddWithModifiers(input, isRegex, ignoreCase)
 				}
 				return input, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
@@ -1168,9 +1233,9 @@ func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
 					input = string(runes[:len(runes)-1])
 				}
 			} else if ev.Key == termbox.KeyArrowUp {
-				input = a.history.Up(input)
+				input, isRegex, ignoreCase = a.history.UpWithModifiers(input, isRegex, ignoreCase)
 			} else if ev.Key == termbox.KeyArrowDown {
-				input = a.history.Down(input)
+				input, isRegex, ignoreCase = a.history.DownWithModifiers(input, isRegex, ignoreCase)
 			} else if ev.Key == termbox.KeyCtrlR {
 				isRegex = !isRegex
 			} else if ev.Key == termbox.KeyCtrlI {
@@ -1293,7 +1358,7 @@ func (a *App) promptForFilter(prompt string) (string, bool, bool, bool) {
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
 				if input != "" {
-					a.history.Add(input)
+					a.history.AddWithModifiers(input, isRegex, ignoreCase)
 				}
 				return input, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
@@ -1305,9 +1370,9 @@ func (a *App) promptForFilter(prompt string) (string, bool, bool, bool) {
 					input = string(runes[:len(runes)-1])
 				}
 			} else if ev.Key == termbox.KeyArrowUp {
-				input = a.history.Up(input)
+				input, isRegex, ignoreCase = a.history.UpWithModifiers(input, isRegex, ignoreCase)
 			} else if ev.Key == termbox.KeyArrowDown {
-				input = a.history.Down(input)
+				input, isRegex, ignoreCase = a.history.DownWithModifiers(input, isRegex, ignoreCase)
 			} else if ev.Key == termbox.KeyCtrlR {
 				isRegex = !isRegex
 			} else if ev.Key == termbox.KeyCtrlI {
