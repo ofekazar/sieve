@@ -128,13 +128,14 @@ func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, te
 }
 
 type Viewer struct {
-	lines   []string     // All lines from the file
-	mu      sync.RWMutex // Protects lines during background loading
-	loading bool         // True while file is still loading
-	topLine int          // Index of the line at the top of the screen
-	leftCol int          // Horizontal scroll offset
-	width   int          // Terminal width
-	height  int          // Terminal height
+	lines    []string     // All lines from the file
+	mu       sync.RWMutex // Protects lines during background loading
+	loading  bool         // True while file is still loading
+	filename string       // Original filename (empty for filtered views)
+	topLine  int          // Index of the line at the top of the screen
+	leftCol  int          // Horizontal scroll offset
+	width    int          // Terminal width
+	height   int          // Terminal height
 }
 
 // ViewerStack manages a stack of viewers for filtering navigation
@@ -368,10 +369,11 @@ func NewViewer(filename string) (*Viewer, error) {
 	}
 
 	v := &Viewer{
-		lines:   nil,
-		loading: true,
-		topLine: 0,
-		leftCol: 0,
+		lines:    nil,
+		loading:  true,
+		filename: filename,
+		topLine:  0,
+		leftCol:  0,
 	}
 
 	// Load file in background (sequential - optimal for I/O bound disk reads)
@@ -406,10 +408,11 @@ func NewViewer(filename string) (*Viewer, error) {
 // NewViewerFromLines creates a Viewer from an existing slice of lines
 func NewViewerFromLines(lines []string) *Viewer {
 	return &Viewer{
-		lines:   lines,
-		loading: false,
-		topLine: 0,
-		leftCol: 0,
+		lines:    lines,
+		loading:  false,
+		filename: "", // empty for test viewers
+		topLine:  0,
+		leftCol:  0,
 	}
 }
 
@@ -512,11 +515,23 @@ func (v *Viewer) drawStatusBarWithDepth(depth int) {
 		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
 	}
 
+	// Draw left-aligned status
 	for i, char := range status {
 		if i >= v.width {
 			break
 		}
 		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+	}
+
+	// Draw right-aligned filename
+	if v.filename != "" {
+		filenameDisplay := " " + v.filename + " "
+		startX := v.width - len([]rune(filenameDisplay))
+		if startX > len(status) { // Only if there's room
+			for i, char := range filenameDisplay {
+				termbox.SetCell(startX+i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+			}
+		}
 	}
 }
 
@@ -951,10 +966,11 @@ func (a *App) HandleFilter(keep bool) {
 
 		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
-			lines:   nil,
-			loading: true,
-			topLine: 0,
-			leftCol: 0,
+			lines:    nil,
+			loading:  true,
+			filename: current.filename,
+			topLine:  0,
+			leftCol:  0,
 		}
 		a.stack.Push(newViewer)
 		a.search.Clear()
@@ -1065,10 +1081,11 @@ func (a *App) HandleFilterAppend() {
 
 		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
-			lines:   nil,
-			loading: true,
-			topLine: 0,
-			leftCol: 0,
+			lines:    nil,
+			loading:  true,
+			filename: current.filename,
+			topLine:  0,
+			leftCol:  0,
 		}
 		a.stack.Push(newViewer)
 		a.search.Clear()
