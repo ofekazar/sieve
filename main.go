@@ -1204,7 +1204,7 @@ func (v *Viewer) run() error {
 	}
 	defer termbox.Close()
 
-	termbox.SetInputMode(termbox.InputEsc)
+	termbox.SetInputMode(termbox.InputEsc | termbox.InputMouse)
 	termbox.SetOutputMode(termbox.Output256)
 
 	app := NewApp(v)
@@ -1282,6 +1282,20 @@ func (v *Viewer) run() error {
 					app.ShowHelp()
 				case termbox.KeyEsc, termbox.KeyCtrlC:
 					return nil
+				}
+			}
+			app.Draw()
+
+		case termbox.EventMouse:
+			current := app.stack.Current()
+			switch ev.Key {
+			case termbox.MouseWheelUp:
+				for i := 0; i < 3; i++ {
+					current.navigateUp()
+				}
+			case termbox.MouseWheelDown:
+				for i := 0; i < 3; i++ {
+					current.navigateDown()
 				}
 			}
 			app.Draw()
