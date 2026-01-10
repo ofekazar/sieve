@@ -274,14 +274,15 @@ type ViewerStack struct {
 
 // App holds the application state
 type App struct {
-	stack         *ViewerStack
-	search        *SearchState
-	history       *History // Shared history for filters and searches
-	statusMessage string
-	messageExpiry time.Time
-	visualMode    bool // True when in visual selection mode
-	visualStart   int  // Starting line of visual selection
-	visualCursor  int  // Current cursor line in visual mode
+	stack           *ViewerStack
+	search          *SearchState
+	history         *History // Shared history for filters and searches
+	statusMessage   string
+	messageExpiry   time.Time
+	visualMode      bool   // True when in visual selection mode
+	visualStart     int    // Starting line of visual selection
+	visualCursor    int    // Current cursor line in visual mode
+	timestampFormat string // Python-style datetime format for timestamp search
 }
 
 // History manages persistent command history (for filters and searches)
@@ -1350,6 +1351,178 @@ func (a *App) YankVisualSelection() {
 	}
 }
 
+// pythonToGoFormat converts Python datetime format to Go time format
+func pythonToGoFormat(pyFormat string) string {
+	replacements := []struct{ py, go_ string }{
+		{"%Y", "2006"},
+		{"%y", "06"},
+		{"%m", "01"},
+		{"%-d", "2"},  // day without zero padding
+		{"%d", "02"},
+		{"%H", "15"},
+		{"%I", "03"},
+		{"%M", "04"},
+		{"%S", "05"},
+		{"%f", "000000"},
+		{"%p", "PM"},
+		{"%z", "-0700"},
+		{"%Z", "MST"},
+		{"%j", "002"},
+		{"%a", "Mon"},
+		{"%A", "Monday"},
+		{"%b", "Jan"},
+		{"%B", "January"},
+		{"%_d", "_2"}, // space-padded day (for syslog)
+	}
+	result := pyFormat
+	for _, r := range replacements {
+		result = strings.ReplaceAll(result, r.py, r.go_)
+	}
+	return result
+}
+
+// Common timestamp formats to try for auto-detection
+var commonTimestampFormats = []string{
+	"%Y-%m-%d %H:%M:%S",
+	"%Y-%m-%dT%H:%M:%S",
+	"%Y/%m/%d %H:%M:%S",
+	"%d/%m/%Y %H:%M:%S",
+	"%m/%d/%Y %H:%M:%S",
+	"%Y-%m-%d %H:%M:%S.%f",
+	"%H:%M:%S",
+	"%Y%m%d%H%M%S",
+	"[%Y-%m-%d %H:%M:%S]",
+	"%d-%b-%Y %H:%M:%S",
+	"%b %_d %H:%M:%S", // syslog: Jan  4 00:00:01 (space-padded day)
+	"%b %d %H:%M:%S",  // syslog variant with zero-padded day
+}
+
+// detectTimestampFormat tries to detect timestamp format from a line
+func detectTimestampFormat(line string) string {
+	for _, pyFmt := range commonTimestampFormats {
+		goFmt := pythonToGoFormat(pyFmt)
+		// Try to find a matching timestamp in the line
+		// We'll try parsing substrings of appropriate length
+		fmtLen := len(goFmt)
+		for i := 0; i <= len(line)-fmtLen && i < 50; i++ {
+			substr := line[i : i+fmtLen]
+			_, err := time.Parse(goFmt, substr)
+			if err == nil {
+				return pyFmt
+			}
+		}
+	}
+	return ""
+}
+
+// extractTimestamp extracts and parses timestamp from a line using the given format
+func extractTimestamp(line, pyFormat string) (time.Time, bool) {
+	goFmt := pythonToGoFormat(pyFormat)
+	fmtLen := len(goFmt)
+	
+	for i := 0; i <= len(line)-fmtLen && i < 100; i++ {
+		substr := line[i : i+fmtLen]
+		t, err := time.Parse(goFmt, substr)
+		if err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// HandleSetTimestampFormat prompts for Python datetime format string
+func (a *App) HandleSetTimestampFormat() {
+	current := a.stack.Current()
+	input, ok := current.promptForInput("t (timestamp format): ")
+	if !ok {
+		return
+	}
+	if input == "" {
+		a.timestampFormat = ""
+		a.ShowTempMessage("Timestamp format cleared")
+		return
+	}
+	a.timestampFormat = input
+	a.ShowTempMessage(fmt.Sprintf("Format set: %s", input))
+}
+
+// HandleTimestampSearch searches for a timestamp
+func (a *App) HandleTimestampSearch() {
+	current := a.stack.Current()
+	
+	// Get input: 6 digits (hhmmss) or 12 digits (yymmddhhmmss)
+	input, ok := current.promptForInput("b (timestamp [yymmdd]hhmmss): ")
+	if !ok || input == "" {
+		return
+	}
+	
+	// Validate input
+	if len(input) != 6 && len(input) != 12 {
+		a.ShowTempMessage("Enter 6 (hhmmss) or 12 (yymmddhhmmss) digits")
+		return
+	}
+	for _, c := range input {
+		if c < '0' || c > '9' {
+			a.ShowTempMessage("Enter digits only")
+			return
+		}
+	}
+	
+	// Parse target time
+	var targetTime time.Time
+	now := time.Now()
+	if len(input) == 6 {
+		// hhmmss - use today's date
+		h, _ := strconv.Atoi(input[0:2])
+		m, _ := strconv.Atoi(input[2:4])
+		s, _ := strconv.Atoi(input[4:6])
+		targetTime = time.Date(now.Year(), now.Month(), now.Day(), h, m, s, 0, time.Local)
+	} else {
+		// yymmddhhmmss
+		y, _ := strconv.Atoi(input[0:2])
+		mo, _ := strconv.Atoi(input[2:4])
+		d, _ := strconv.Atoi(input[4:6])
+		h, _ := strconv.Atoi(input[6:8])
+		mi, _ := strconv.Atoi(input[8:10])
+		s, _ := strconv.Atoi(input[10:12])
+		year := 2000 + y
+		if y > 50 {
+			year = 1900 + y
+		}
+		targetTime = time.Date(year, time.Month(mo), d, h, mi, s, 0, time.Local)
+	}
+	
+	// Detect or use set format
+	format := a.timestampFormat
+	if format == "" {
+		// Try to detect from current line
+		line := current.GetLine(current.topLine)
+		format = detectTimestampFormat(line)
+		if format == "" {
+			a.ShowTempMessage("Couldn't detect timestamp format. Use 't' to set.")
+			return
+		}
+	}
+	
+	// Search from current line to end
+	lines := current.GetLines()
+	for i := current.topLine; i < len(lines); i++ {
+		ts, ok := extractTimestamp(lines[i], format)
+		if ok {
+			// For time-only searches, adjust the date to match
+			if len(input) == 6 {
+				ts = time.Date(now.Year(), now.Month(), now.Day(), ts.Hour(), ts.Minute(), ts.Second(), 0, time.Local)
+			}
+			if ts.Equal(targetTime) || ts.After(targetTime) {
+				current.topLine = i
+				a.ShowTempMessage(fmt.Sprintf("Found at line %d", i+1))
+				return
+			}
+		}
+	}
+	a.ShowTempMessage("No matching timestamp found")
+}
+
 // ShowHelp displays the help screen
 func (a *App) ShowHelp() {
 	type helpEntry struct {
@@ -1378,7 +1551,8 @@ func (a *App) ShowHelp() {
 			{"n / N", "Next / prev match"},
 			{"^R", "Toggle regex"},
 			{"^I", "Toggle case"},
-			{"↑ / ↓", "History"},
+			{"t", "Set time format"},
+			{"b", "Jump to time"},
 		}},
 		{"Filter", []helpEntry{
 			{"&", "Keep matching"},
@@ -2403,6 +2577,10 @@ func (v *Viewer) run() error {
 					if app.visualMode {
 						app.YankVisualSelection()
 					}
+				case 't':
+					app.HandleSetTimestampFormat()
+				case 'b':
+					app.HandleTimestampSearch()
 				}
 			} else {
 				switch ev.Key {
