@@ -281,6 +281,7 @@ type App struct {
 	messageExpiry time.Time
 	visualMode    bool // True when in visual selection mode
 	visualStart   int  // Starting line of visual selection
+	visualCursor  int  // Current cursor line in visual mode
 }
 
 // History manages persistent command history (for filters and searches)
@@ -1223,13 +1224,94 @@ func (a *App) EnterVisualMode() {
 	current := a.stack.Current()
 	a.visualMode = true
 	a.visualStart = current.topLine
-	a.ShowTempMessage("-- VISUAL --")
+	a.visualCursor = current.topLine
 }
 
 // ExitVisualMode exits visual mode without action
 func (a *App) ExitVisualMode() {
 	a.visualMode = false
 	a.visualStart = 0
+	a.visualCursor = 0
+}
+
+// VisualCursorDown moves cursor down in visual mode, scrolling if needed
+func (a *App) VisualCursorDown() {
+	current := a.stack.Current()
+	lineCount := current.LineCount()
+	
+	if a.visualCursor < lineCount-1 {
+		a.visualCursor++
+		// Scroll if cursor goes below visible area
+		if a.visualCursor >= current.topLine+current.height {
+			current.topLine++
+		}
+	}
+}
+
+// VisualCursorUp moves cursor up in visual mode, scrolling if needed
+func (a *App) VisualCursorUp() {
+	current := a.stack.Current()
+	
+	if a.visualCursor > 0 {
+		a.visualCursor--
+		// Scroll if cursor goes above visible area
+		if a.visualCursor < current.topLine {
+			current.topLine--
+		}
+	}
+}
+
+// VisualPageDown moves cursor down by a page in visual mode
+func (a *App) VisualPageDown() {
+	current := a.stack.Current()
+	lineCount := current.LineCount()
+	
+	a.visualCursor += current.height
+	if a.visualCursor >= lineCount {
+		a.visualCursor = lineCount - 1
+	}
+	// Scroll to keep cursor visible
+	if a.visualCursor >= current.topLine+current.height {
+		current.topLine = a.visualCursor - current.height + 1
+		if current.topLine < 0 {
+			current.topLine = 0
+		}
+	}
+}
+
+// VisualPageUp moves cursor up by a page in visual mode
+func (a *App) VisualPageUp() {
+	current := a.stack.Current()
+	
+	a.visualCursor -= current.height
+	if a.visualCursor < 0 {
+		a.visualCursor = 0
+	}
+	// Scroll to keep cursor visible
+	if a.visualCursor < current.topLine {
+		current.topLine = a.visualCursor
+	}
+}
+
+// VisualGoToStart moves cursor to start of file in visual mode
+func (a *App) VisualGoToStart() {
+	current := a.stack.Current()
+	a.visualCursor = 0
+	current.topLine = 0
+}
+
+// VisualGoToEnd moves cursor to end of file in visual mode
+func (a *App) VisualGoToEnd() {
+	current := a.stack.Current()
+	lineCount := current.LineCount()
+	a.visualCursor = lineCount - 1
+	// Scroll to show cursor
+	if a.visualCursor >= current.topLine+current.height {
+		current.topLine = a.visualCursor - current.height + 1
+		if current.topLine < 0 {
+			current.topLine = 0
+		}
+	}
 }
 
 // YankVisualSelection copies selected lines to clipboard
@@ -1240,7 +1322,7 @@ func (a *App) YankVisualSelection() {
 
 	current := a.stack.Current()
 	startLine := a.visualStart
-	endLine := current.topLine
+	endLine := a.visualCursor
 
 	// Ensure start <= end
 	if startLine > endLine {
@@ -1258,6 +1340,7 @@ func (a *App) YankVisualSelection() {
 
 	a.visualMode = false
 	a.visualStart = 0
+	a.visualCursor = 0
 
 	if err != nil {
 		a.ShowTempMessage("Clipboard error: " + err.Error())
@@ -1926,12 +2009,12 @@ func (a *App) Draw() {
 	if a.visualMode {
 		// Visual mode status bar
 		startLine := a.visualStart
-		endLine := current.topLine
+		endLine := a.visualCursor
 		if startLine > endLine {
 			startLine, endLine = endLine, startLine
 		}
 		status := fmt.Sprintf(" VISUAL: Line %d/%d | Marked %d-%d ",
-			current.topLine+1, current.LineCount(), startLine+1, endLine+1)
+			a.visualCursor+1, current.LineCount(), startLine+1, endLine+1)
 		a.drawVisualStatusBar(current, status)
 		termbox.Flush()
 	} else if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
@@ -1972,7 +2055,7 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 	var visualStart, visualEnd int
 	if a.visualMode {
 		visualStart = a.visualStart
-		visualEnd = current.topLine
+		visualEnd = a.visualCursor
 		if visualStart > visualEnd {
 			visualStart, visualEnd = visualEnd, visualStart
 		}
@@ -2242,13 +2325,25 @@ func (v *Viewer) run() error {
 			if ev.Ch != 0 {
 				switch ev.Ch {
 				case 'q':
-					return nil
+					if app.visualMode {
+						app.ExitVisualMode()
+					} else {
+						return nil
+					}
 				case 'H':
 					app.ShowHelp()
 				case 'j':
-					current.navigateDown()
+					if app.visualMode {
+						app.VisualCursorDown()
+					} else {
+						current.navigateDown()
+					}
 				case 'k':
-					current.navigateUp()
+					if app.visualMode {
+						app.VisualCursorUp()
+					} else {
+						current.navigateUp()
+					}
 				case 'h':
 					current.navigateLeft(current.width / 4)
 				case 'l':
@@ -2258,9 +2353,17 @@ func (v *Viewer) run() error {
 					current.leftCol = 0         // Reset horizontal scroll when toggling wrap
 					current.topLineOffset = 0   // Reset line offset
 				case 'g':
-					current.goToStart()
+					if app.visualMode {
+						app.VisualGoToStart()
+					} else {
+						current.goToStart()
+					}
 				case 'G':
-					current.goToEnd()
+					if app.visualMode {
+						app.VisualGoToEnd()
+					} else {
+						current.goToEnd()
+					}
 				case ':':
 					app.HandleGotoLine()
 				case ';':
@@ -2304,21 +2407,45 @@ func (v *Viewer) run() error {
 			} else {
 				switch ev.Key {
 				case termbox.KeyArrowUp:
-					current.navigateUp()
+					if app.visualMode {
+						app.VisualCursorUp()
+					} else {
+						current.navigateUp()
+					}
 				case termbox.KeyArrowDown:
-					current.navigateDown()
+					if app.visualMode {
+						app.VisualCursorDown()
+					} else {
+						current.navigateDown()
+					}
 				case termbox.KeyArrowLeft:
 					current.navigateLeft(current.width / 4)
 				case termbox.KeyArrowRight:
 					current.navigateRight(current.width / 4)
 				case termbox.KeyPgdn, termbox.KeySpace:
-					current.pageDown()
+					if app.visualMode {
+						app.VisualPageDown()
+					} else {
+						current.pageDown()
+					}
 				case termbox.KeyPgup:
-					current.pageUp()
+					if app.visualMode {
+						app.VisualPageUp()
+					} else {
+						current.pageUp()
+					}
 				case termbox.KeyHome:
-					current.goToStart()
+					if app.visualMode {
+						app.VisualGoToStart()
+					} else {
+						current.goToStart()
+					}
 				case termbox.KeyEnd:
-					current.goToEnd()
+					if app.visualMode {
+						app.VisualGoToEnd()
+					} else {
+						current.goToEnd()
+					}
 				case termbox.KeyCtrlU:
 					app.HandleStackNav(false)
 				case termbox.KeyF1:
