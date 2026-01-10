@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -247,6 +248,7 @@ func isJSON(line string) bool {
 
 type Viewer struct {
 	lines            []string     // All lines from the file
+	originIndices    []int        // Maps each line to its index in parent viewer (for filtered views)
 	mu               sync.RWMutex // Protects lines during background loading
 	loading          bool         // True while file is still loading
 	filename         string       // Original filename (empty for filtered views)
@@ -1379,6 +1381,7 @@ func (a *App) HandleFilter(keep bool) {
 			foundMatch := false
 			matchesBefore := 0
 			lineCount := 0
+			var allIndices []int
 
 			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
 				chunk := results[chunkIdx]
@@ -1388,6 +1391,8 @@ func (a *App) HandleFilter(keep bool) {
 					newViewer.mu.Unlock()
 
 					origIdx := chunk.indices[j]
+					allIndices = append(allIndices, origIdx)
+
 					if origIdx >= currentTopLine && !foundMatch {
 						foundMatch = true
 						newViewer.topLine = matchesBefore
@@ -1404,6 +1409,7 @@ func (a *App) HandleFilter(keep bool) {
 			}
 
 			newViewer.mu.Lock()
+			newViewer.originIndices = allIndices
 			newViewer.loading = false
 			newViewer.mu.Unlock()
 			termbox.Interrupt()
@@ -1454,6 +1460,7 @@ func (a *App) HandleFilterAppend() {
 			type appendChunkResult struct {
 				chunkIdx int
 				lines    []string
+				indices  []int
 			}
 			resultChan := make(chan appendChunkResult, numWorkers)
 
@@ -1484,12 +1491,14 @@ func (a *App) HandleFilterAppend() {
 
 				go func(chunkIdx, start, end int) {
 					var chunkLines []string
+					var chunkIndices []int
 					for i := start; i < end; i++ {
 						if inCurrent[i] || strings.Contains(originalLines[i], query) {
 							chunkLines = append(chunkLines, originalLines[i])
+							chunkIndices = append(chunkIndices, i)
 						}
 					}
-					resultChan <- appendChunkResult{chunkIdx, chunkLines}
+					resultChan <- appendChunkResult{chunkIdx, chunkLines, chunkIndices}
 				}(w, start, end)
 			}
 
@@ -1508,10 +1517,11 @@ func (a *App) HandleFilterAppend() {
 			// Merge results in order and stream to viewer
 			foundCurrentLine := false
 			lineCount := 0
+			var allIndices []int
 
 			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
 				chunk := results[chunkIdx]
-				for _, line := range chunk.lines {
+				for j, line := range chunk.lines {
 					newViewer.mu.Lock()
 					newViewer.lines = append(newViewer.lines, line)
 					if !foundCurrentLine && line == currentLine {
@@ -1519,6 +1529,8 @@ func (a *App) HandleFilterAppend() {
 						newViewer.topLine = len(newViewer.lines) - 1
 					}
 					newViewer.mu.Unlock()
+
+					allIndices = append(allIndices, chunk.indices[j])
 
 					lineCount++
 					if lineCount <= 100 || lineCount%1000 == 0 {
@@ -1528,6 +1540,7 @@ func (a *App) HandleFilterAppend() {
 			}
 
 			newViewer.mu.Lock()
+			newViewer.originIndices = allIndices
 			newViewer.loading = false
 			newViewer.mu.Unlock()
 			termbox.Interrupt()
@@ -1631,7 +1644,26 @@ func (a *App) HandleSearchNav(reverse bool) {
 // If reset is true (=), resets to first viewer; if false (^U), pops one level
 func (a *App) HandleStackNav(reset bool) {
 	current := a.stack.Current()
-	currentLine := current.GetLine(current.topLine)
+	topLine := current.topLine
+
+	// Get the target line index in the parent/original viewer
+	var targetLine int
+	if len(current.originIndices) > 0 && topLine < len(current.originIndices) {
+		targetLine = current.originIndices[topLine]
+	} else {
+		targetLine = topLine
+	}
+
+	// For reset, we need to trace back through all viewers to find original index
+	if reset && len(a.stack.viewers) > 1 {
+		// Walk up the stack to find the original line number
+		for i := len(a.stack.viewers) - 1; i >= 1; i-- {
+			v := a.stack.viewers[i]
+			if len(v.originIndices) > 0 && targetLine < len(v.originIndices) {
+				targetLine = v.originIndices[targetLine]
+			}
+		}
+	}
 
 	var changed bool
 	if reset {
@@ -1640,14 +1672,28 @@ func (a *App) HandleStackNav(reset bool) {
 		changed = a.stack.Pop()
 	}
 
-	if changed && currentLine != "" {
-		// Find this line in the new current viewer to stay on the same line
+	if changed {
 		newCurrent := a.stack.Current()
-		newLines := newCurrent.GetLines()
-		for i, line := range newLines {
-			if line == currentLine {
-				newCurrent.topLine = i
-				break
+		newCurrent.topLineOffset = 0
+
+		// If newCurrent has originIndices, find closest line using binary search
+		if len(newCurrent.originIndices) > 0 {
+			// Binary search for the target line or closest below it
+			idx := sort.Search(len(newCurrent.originIndices), func(i int) bool {
+				return newCurrent.originIndices[i] >= targetLine
+			})
+			if idx < len(newCurrent.originIndices) {
+				newCurrent.topLine = idx
+			} else if len(newCurrent.originIndices) > 0 {
+				newCurrent.topLine = len(newCurrent.originIndices) - 1
+			}
+		} else {
+			// No originIndices (original file), just use the target line clamped to bounds
+			lineCount := newCurrent.LineCount()
+			if targetLine >= lineCount {
+				newCurrent.topLine = lineCount - 1
+			} else {
+				newCurrent.topLine = targetLine
 			}
 		}
 	}
