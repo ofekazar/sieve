@@ -863,6 +863,29 @@ func (a *App) HandleFilterAppend() {
 	}
 }
 
+// HandleGotoLine prompts for a line number and jumps to it
+func (a *App) HandleGotoLine() {
+	current := a.stack.Current()
+	input, ok := current.promptForInput(":")
+	if ok && input != "" {
+		lineNum, err := strconv.Atoi(input)
+		if err != nil {
+			a.ShowTempMessage("Invalid line number")
+			return
+		}
+		// Convert to 0-based index
+		lineIdx := lineNum - 1
+		if lineIdx < 0 {
+			lineIdx = 0
+		}
+		maxLine := current.LineCount() - 1
+		if lineIdx > maxLine {
+			lineIdx = maxLine
+		}
+		current.topLine = lineIdx
+	}
+}
+
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
@@ -1048,6 +1071,8 @@ func (v *Viewer) run() error {
 					current.goToStart()
 				case 'G':
 					current.goToEnd()
+				case ':':
+					app.HandleGotoLine()
 				case '&':
 					app.HandleFilter(true)
 				case '-':
