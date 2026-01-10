@@ -132,7 +132,6 @@ func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, te
 // findJSONStart finds the start index of embedded JSON in a line
 // Returns -1 if no JSON found
 func findJSONStart(line string) int {
-	// Look for JSON after common prefixes like ": {", "= {", ": [", "= ["
 	for i := 0; i < len(line); i++ {
 		if line[i] == '{' || line[i] == '[' {
 			return i
@@ -247,16 +246,19 @@ func isJSON(line string) bool {
 }
 
 type Viewer struct {
-	lines      []string     // All lines from the file
-	mu         sync.RWMutex // Protects lines during background loading
-	loading    bool         // True while file is still loading
-	filename   string       // Original filename (empty for filtered views)
-	wordWrap   bool         // Word wrap mode
-	jsonPretty bool         // JSON pretty-print mode
-	topLine    int          // Index of the line at the top of the screen
-	leftCol    int          // Horizontal scroll offset
-	width      int          // Terminal width
-	height     int          // Terminal height
+	lines            []string     // All lines from the file
+	mu               sync.RWMutex // Protects lines during background loading
+	loading          bool         // True while file is still loading
+	filename         string       // Original filename (empty for filtered views)
+	wordWrap         bool         // Word wrap mode
+	jsonPretty       bool         // JSON pretty-print mode
+	topLine          int          // Index of the line at the top of the screen
+	topLineOffset    int          // Offset within expanded line (for wrap/JSON mode)
+	leftCol          int          // Horizontal scroll offset
+	width            int          // Terminal width
+	height           int          // Terminal height
+	expandedCache    map[int]int  // Cache of expanded line counts (lineIdx -> rowCount)
+	expandedCacheKey string       // Key to invalidate cache (mode+width)
 }
 
 // ViewerStack manages a stack of viewers for filtering navigation
@@ -706,9 +708,79 @@ func (v *Viewer) showMessage(msg string) {
 	termbox.Flush()
 }
 
+// getExpandedLineCount returns how many screen rows a line expands to
+func (v *Viewer) getExpandedLineCount(lineIdx int) int {
+	if lineIdx < 0 || lineIdx >= v.LineCount() {
+		return 1
+	}
+	if v.width <= 0 {
+		return 1 // Safety: avoid division by zero
+	}
+
+	// Build cache key based on current mode and width
+	cacheKey := fmt.Sprintf("%v:%v:%d", v.wordWrap, v.jsonPretty, v.width)
+	if v.expandedCacheKey != cacheKey {
+		// Mode or width changed, invalidate cache
+		v.expandedCache = make(map[int]int)
+		v.expandedCacheKey = cacheKey
+	}
+
+	// Check cache
+	if v.expandedCache != nil {
+		if count, ok := v.expandedCache[lineIdx]; ok {
+			return count
+		}
+	} else {
+		v.expandedCache = make(map[int]int)
+	}
+
+	// Calculate expanded count
+	line := v.GetLine(lineIdx)
+
+	// Get expanded lines (JSON or original)
+	var lines []string
+	if v.jsonPretty && isJSON(line) {
+		lines = formatJSON(line)
+	} else {
+		lines = []string{line}
+	}
+
+	var totalRows int
+	if !v.wordWrap {
+		totalRows = len(lines)
+	} else {
+		// Count wrapped rows for each line
+		for _, l := range lines {
+			cells := parseANSI(l)
+			if len(cells) == 0 {
+				totalRows++
+			} else {
+				totalRows += (len(cells) + v.width - 1) / v.width
+			}
+		}
+	}
+
+	if totalRows == 0 {
+		totalRows = 1
+	}
+
+	// Store in cache
+	v.expandedCache[lineIdx] = totalRows
+	return totalRows
+}
+
 func (v *Viewer) navigateUp() {
-	if v.topLine > 0 {
-		v.topLine--
+	if v.wordWrap || v.jsonPretty {
+		if v.topLineOffset > 0 {
+			v.topLineOffset--
+		} else if v.topLine > 0 {
+			v.topLine--
+			v.topLineOffset = v.getExpandedLineCount(v.topLine) - 1
+		}
+	} else {
+		if v.topLine > 0 {
+			v.topLine--
+		}
 	}
 }
 
@@ -717,8 +789,19 @@ func (v *Viewer) navigateDown() {
 	if maxTop < 0 {
 		maxTop = 0
 	}
-	if v.topLine < maxTop {
-		v.topLine++
+
+	if v.wordWrap || v.jsonPretty {
+		expandedCount := v.getExpandedLineCount(v.topLine)
+		if v.topLineOffset < expandedCount-1 {
+			v.topLineOffset++
+		} else if v.topLine < maxTop {
+			v.topLine++
+			v.topLineOffset = 0
+		}
+	} else {
+		if v.topLine < maxTop {
+			v.topLine++
+		}
 	}
 }
 
@@ -735,29 +818,45 @@ func (v *Viewer) navigateRight(amount int) {
 }
 
 func (v *Viewer) pageDown() {
-	v.topLine += v.height
-	// Allow scrolling until last line is at top
-	maxTop := v.LineCount() - 1
-	if maxTop < 0 {
-		maxTop = 0
-	}
-	if v.topLine > maxTop {
-		v.topLine = maxTop
+	if v.wordWrap || v.jsonPretty {
+		// Move by screen height rows
+		for i := 0; i < v.height; i++ {
+			v.navigateDown()
+		}
+	} else {
+		v.topLine += v.height
+		// Allow scrolling until last line is at top
+		maxTop := v.LineCount() - 1
+		if maxTop < 0 {
+			maxTop = 0
+		}
+		if v.topLine > maxTop {
+			v.topLine = maxTop
+		}
 	}
 }
 
 func (v *Viewer) pageUp() {
-	v.topLine -= v.height
-	if v.topLine < 0 {
-		v.topLine = 0
+	if v.wordWrap || v.jsonPretty {
+		// Move by screen height rows
+		for i := 0; i < v.height; i++ {
+			v.navigateUp()
+		}
+	} else {
+		v.topLine -= v.height
+		if v.topLine < 0 {
+			v.topLine = 0
+		}
 	}
 }
 
 func (v *Viewer) goToStart() {
 	v.topLine = 0
+	v.topLineOffset = 0
 }
 
 func (v *Viewer) goToEnd() {
+	v.topLineOffset = 0
 	// Go to last line at top
 	v.topLine = v.LineCount() - 1
 	if v.topLine < 0 {
@@ -1582,6 +1681,7 @@ func (a *App) Draw() {
 func (a *App) drawNormal(current *Viewer, lineCount int) {
 	screenY := 0
 	lineIndex := current.topLine
+	skipRows := current.topLineOffset // Skip this many rows at start
 
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
@@ -1595,6 +1695,10 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 		}
 
 		for _, renderLine := range linesToRender {
+			if skipRows > 0 {
+				skipRows--
+				continue
+			}
 			if screenY >= current.height {
 				break
 			}
@@ -1628,6 +1732,7 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 func (a *App) drawWrapped(current *Viewer, lineCount int) {
 	screenY := 0
 	lineIndex := current.topLine
+	skipRows := current.topLineOffset // Skip this many rows at start
 
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
@@ -1641,22 +1746,33 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 		}
 
 		for _, renderLine := range linesToRender {
-			if screenY >= current.height {
-				break
-			}
-
 			cells := parseANSI(renderLine)
 			matchPositions := a.getMatchPositions(cells)
 
 			if len(cells) == 0 {
 				// Empty line
-				screenY++
+				if skipRows > 0 {
+					skipRows--
+				} else if screenY < current.height {
+					screenY++
+				}
 				continue
 			}
 
 			// Wrap the line across multiple screen rows
 			cellIdx := 0
-			for cellIdx < len(cells) && screenY < current.height {
+			for cellIdx < len(cells) {
+				if skipRows > 0 {
+					// Skip this wrapped row
+					skipRows--
+					// Advance cellIdx by one row's worth
+					cellIdx += current.width
+					continue
+				}
+				if screenY >= current.height {
+					break
+				}
+
 				screenX := 0
 				for screenX < current.width && cellIdx < len(cells) {
 					cell := cells[cellIdx]
@@ -1776,7 +1892,8 @@ func (v *Viewer) run() error {
 					current.navigateRight(current.width / 4)
 				case 'w':
 					current.wordWrap = !current.wordWrap
-					current.leftCol = 0 // Reset horizontal scroll when toggling wrap
+					current.leftCol = 0         // Reset horizontal scroll when toggling wrap
+					current.topLineOffset = 0   // Reset line offset
 				case 'g':
 					current.goToStart()
 				case 'G':
@@ -1787,6 +1904,7 @@ func (v *Viewer) run() error {
 					app.HandleExport()
 				case 'f':
 					current.jsonPretty = !current.jsonPretty
+					current.topLineOffset = 0 // Reset line offset
 				case '&':
 					app.HandleFilter(true)
 				case '-':
