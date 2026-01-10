@@ -711,6 +711,72 @@ func (a *App) ShowTempMessage(msg string) {
 	}()
 }
 
+// ShowHelp displays the help screen
+func (a *App) ShowHelp() {
+	helpLines := []string{
+		"                    HELP - Press any key to close                    ",
+		"",
+		"  Navigation:",
+		"    j/↓         Move down one line",
+		"    k/↑         Move up one line",
+		"    h/←         Scroll left",
+		"    l/→         Scroll right",
+		"    g/Home      Go to start of file",
+		"    G/End       Go to end of file",
+		"    Space/PgDn  Page down",
+		"    PgUp        Page up",
+		"    :<number>   Go to line number",
+		"",
+		"  Search:",
+		"    /           Search forward",
+		"    ?           Search backward",
+		"    n           Next match",
+		"    N           Previous match",
+		"    Ctrl+R      Toggle regex mode (in search)",
+		"    Ctrl+I      Toggle case-insensitive (in search)",
+		"",
+		"  Filter:",
+		"    &           Keep lines matching pattern",
+		"    -           Exclude lines matching pattern",
+		"    +           Add lines matching pattern from original",
+		"    =           Reset to original file",
+		"    Ctrl+U      Go back one filter level",
+		"",
+		"  Other:",
+		"    w           Toggle word wrap",
+		"    H/F1        Show this help",
+		"    q/Esc       Quit",
+	}
+
+	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+	width, height := termbox.Size()
+
+	for y, line := range helpLines {
+		if y >= height-1 {
+			break
+		}
+		x := (width - len(line)) / 2
+		if x < 0 {
+			x = 0
+		}
+		for i, ch := range line {
+			if x+i >= width {
+				break
+			}
+			termbox.SetCell(x+i, y+1, ch, termbox.ColorDefault, termbox.ColorDefault)
+		}
+	}
+	termbox.Flush()
+
+	// Wait for any key
+	for {
+		ev := termbox.PollEvent()
+		if ev.Type == termbox.EventKey {
+			break
+		}
+	}
+}
+
 // ClearMessage clears the status message
 func (a *App) ClearMessage() {
 	a.statusMessage = ""
@@ -1155,6 +1221,8 @@ func (v *Viewer) run() error {
 				switch ev.Ch {
 				case 'q':
 					return nil
+				case 'H':
+					app.ShowHelp()
 				case 'j':
 					current.navigateDown()
 				case 'k':
@@ -1210,6 +1278,8 @@ func (v *Viewer) run() error {
 					current.goToEnd()
 				case termbox.KeyCtrlU:
 					app.HandleStackNav(false)
+				case termbox.KeyF1:
+					app.ShowHelp()
 				case termbox.KeyEsc, termbox.KeyCtrlC:
 					return nil
 				}
