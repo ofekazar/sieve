@@ -1,6 +1,6 @@
 # CUT
 
-An in-memory file viewer with powerful filtering capabilities for navigating large log files.
+An in-memory, AI slop, file viewer with powerful filtering capabilities for navigating large log files.
 
 **Inspired by [slit](https://github.com/tigrawap/slit)** - a modern pager for viewing logs.
 **Build with [termbox-go](https://github.com/nsf/termbox-go)**
