@@ -2903,11 +2903,38 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 	return v, nil
 }
 
+const version = "1.0.0"
+
 func main() {
 	// Parse command line flags
 	followFlag := flag.Bool("f", false, "Follow mode (like tail -f)")
 	followLongFlag := flag.Bool("follow", false, "Follow mode (like tail -f)")
+	helpFlag := flag.Bool("h", false, "Show help")
+	helpLongFlag := flag.Bool("help", false, "Show help")
+	versionFlag := flag.Bool("version", false, "Show version")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "cut - An in-memory file viewer with powerful filtering\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: cut [OPTIONS] <filename> [filename2] [filename3] ...\n")
+		fmt.Fprintf(os.Stderr, "       command | cut\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  -f, --follow    Follow mode (like tail -f)\n")
+		fmt.Fprintf(os.Stderr, "  -h, --help      Show this help message\n")
+		fmt.Fprintf(os.Stderr, "      --version   Show version\n\n")
+		fmt.Fprintf(os.Stderr, "Press 'H' or F1 while running for keybinding help.\n")
+	}
+
 	flag.Parse()
+
+	if *helpFlag || *helpLongFlag {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	if *versionFlag {
+		fmt.Printf("cut version %s\n", version)
+		os.Exit(0)
+	}
 
 	follow := *followFlag || *followLongFlag
 	args := flag.Args()
@@ -2935,8 +2962,7 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		fmt.Println("Usage: cut [-f|--follow] <filename> [filename2] [filename3] ...")
-		fmt.Println("       command | cut")
+		flag.Usage()
 		os.Exit(1)
 	}
 
