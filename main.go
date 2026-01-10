@@ -4,12 +4,127 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nsf/termbox-go"
 )
+
+// ansiCell represents a character with its color attributes
+type ansiCell struct {
+	char rune
+	fg   termbox.Attribute
+	bg   termbox.Attribute
+}
+
+// parseANSI parses a line with ANSI escape codes and returns cells with colors
+func parseANSI(line string) []ansiCell {
+	// Fast path: check for escape character using byte scan (faster than strings.Contains)
+	hasEscape := false
+	for i := 0; i < len(line); i++ {
+		if line[i] == 0x1b {
+			hasEscape = true
+			break
+		}
+	}
+
+	if !hasEscape {
+		runes := []rune(line)
+		cells := make([]ansiCell, len(runes))
+		for i, r := range runes {
+			cells[i] = ansiCell{r, termbox.ColorDefault, termbox.ColorDefault}
+		}
+		return cells
+	}
+
+	// Slow path: parse ANSI escape sequences
+	var cells []ansiCell
+	fg := termbox.ColorDefault
+	bg := termbox.ColorDefault
+
+	i := 0
+	runes := []rune(line)
+	for i < len(runes) {
+		// Check for escape sequence
+		if runes[i] == '\x1b' && i+1 < len(runes) && runes[i+1] == '[' {
+			// Find end of escape sequence
+			end := i + 2
+			for end < len(runes) && runes[end] != 'm' {
+				end++
+			}
+			if end < len(runes) {
+				// Parse the escape sequence
+				seq := string(runes[i+2 : end])
+				fg, bg = applyANSICodes(seq, fg, bg)
+				i = end + 1
+				continue
+			}
+		}
+		cells = append(cells, ansiCell{runes[i], fg, bg})
+		i++
+	}
+	return cells
+}
+
+// applyANSICodes applies ANSI codes and returns updated colors
+func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, termbox.Attribute) {
+	if seq == "" || seq == "0" {
+		return termbox.ColorDefault, termbox.ColorDefault
+	}
+
+	parts := strings.Split(seq, ";")
+	i := 0
+	for i < len(parts) {
+		code, err := strconv.Atoi(parts[i])
+		if err != nil {
+			i++
+			continue
+		}
+
+		switch {
+		case code == 0:
+			fg, bg = termbox.ColorDefault, termbox.ColorDefault
+		case code == 1:
+			fg |= termbox.AttrBold
+		case code == 4:
+			fg |= termbox.AttrUnderline
+		case code == 7:
+			fg |= termbox.AttrReverse
+		case code >= 30 && code <= 37:
+			fg = termbox.Attribute(code-30+1) | (fg & 0xFF00)
+		case code == 39:
+			fg = termbox.ColorDefault | (fg & 0xFF00)
+		case code >= 40 && code <= 47:
+			bg = termbox.Attribute(code - 40 + 1)
+		case code == 49:
+			bg = termbox.ColorDefault
+		case code >= 90 && code <= 97:
+			fg = termbox.Attribute(code-90+9) | (fg & 0xFF00)
+		case code >= 100 && code <= 107:
+			bg = termbox.Attribute(code - 100 + 9)
+		case code == 38 && i+2 < len(parts):
+			// 256 color foreground: 38;5;N
+			if parts[i+1] == "5" {
+				if n, err := strconv.Atoi(parts[i+2]); err == nil {
+					fg = termbox.Attribute(n+1) | (fg & 0xFF00)
+				}
+				i += 2
+			}
+		case code == 48 && i+2 < len(parts):
+			// 256 color background: 48;5;N
+			if parts[i+1] == "5" {
+				if n, err := strconv.Atoi(parts[i+2]); err == nil {
+					bg = termbox.Attribute(n + 1)
+				}
+				i += 2
+			}
+		}
+		i++
+	}
+	return fg, bg
+}
 
 type Viewer struct {
 	lines   []string     // All lines from the file
@@ -143,12 +258,11 @@ func NewViewer(filename string) (*Viewer, error) {
 		leftCol: 0,
 	}
 
-	// Load file in background
+	// Load file in background (sequential - optimal for I/O bound disk reads)
 	go func() {
 		defer file.Close()
 
 		scanner := bufio.NewScanner(file)
-		// Handle very long lines
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 10*1024*1024)
 
@@ -159,7 +273,6 @@ func NewViewer(filename string) (*Viewer, error) {
 			v.mu.Unlock()
 
 			lineCount++
-			// Trigger redraw periodically during initial load
 			if lineCount <= 100 || lineCount%1000 == 0 {
 				termbox.Interrupt()
 			}
@@ -168,7 +281,7 @@ func NewViewer(filename string) (*Viewer, error) {
 		v.mu.Lock()
 		v.loading = false
 		v.mu.Unlock()
-		termbox.Interrupt() // Final redraw when done
+		termbox.Interrupt()
 	}()
 
 	return v, nil
@@ -839,16 +952,16 @@ func (a *App) Draw() {
 			break
 		}
 		line := current.GetLine(lineIndex)
-		runes := []rune(line)
+		cells := parseANSI(line)
 		screenX := 0
-		for i, char := range runes {
+		for i, cell := range cells {
 			if i < current.leftCol {
 				continue
 			}
 			if screenX >= current.width {
 				break
 			}
-			termbox.SetCell(screenX, screenY, char, termbox.ColorDefault, termbox.ColorDefault)
+			termbox.SetCell(screenX, screenY, cell.char, cell.fg, cell.bg)
 			screenX++
 		}
 	}
