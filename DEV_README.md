@@ -26,11 +26,15 @@ The root container holding all application state.
 
 ```go
 type App struct {
-    stack         *ViewerStack  // Stack of viewers for filter navigation
-    search        *SearchState  // Current search query and results
-    history       *History      // Shared history for filters and searches
-    statusMessage string        // Temporary message displayed in status bar
-    messageExpiry time.Time     // When to clear the status message
+    stack           *ViewerStack  // Stack of viewers for filter navigation
+    search          *SearchState  // Current search query and results
+    history         *History      // Shared history for filters and searches
+    statusMessage   string        // Temporary message displayed in status bar
+    messageExpiry   time.Time     // When to clear the status message
+    timestampFormat string        // User-defined timestamp format for 't'/'b' commands
+    visualMode      bool          // Visual selection mode active
+    visualStart     int           // Starting line of visual selection
+    visualCursor    int           // Current cursor position in visual mode
 }
 ```
 
@@ -87,6 +91,8 @@ type Viewer struct {
     // Display modes
     wordWrap   bool  // Wrap long lines
     jsonPretty bool  // Pretty-print JSON
+    stickyLeft int   // Number of left chars to keep visible when scrolling (K)
+    follow     bool  // Follow mode (like tail -f)
     
     // Performance
     expandedCache    map[int]int  // lineIdx → screen row count
@@ -225,13 +231,13 @@ Press ↓                       ▼
 main()
   │
   ▼
-NewViewer(filename) ─────────────────────────────────────┐
+NewViewer(filename) ──────────────────────────────────────┐
   │                                                       │
   ▼                                                       │
-NewApp(viewer) ──► ViewerStack{viewers: [viewer]}        │
+NewApp(viewer) ──► ViewerStack{viewers: [viewer]}         │
   │                                                       │
   ▼                                                       │
-viewer.run() ──► termbox event loop                      │
+viewer.run() ──► termbox event loop                       │
   │                                                       │
   │     ┌─────────────────────────────────────────────────┘
   │     │ Background goroutine
@@ -351,3 +357,118 @@ expandedCache stores: lineIdx → total screen rows
 | `batchSize` (file load) | 10,000 | Lines per mutex lock during file load |
 | `numWorkers` (filter) | 8 | Parallel workers for filtering |
 | `maxHistoryEntries` | 100 | Max persisted history entries |
+| `version` | "1.0.0" | Application version |
+
+---
+
+## Additional Features
+
+### Multi-File Support
+
+When multiple files are passed as arguments, they are merged by timestamp:
+
+```go
+type fileStream struct {
+    scanner   *bufio.Scanner  // File scanner
+    file      *os.File        // Open file handle
+    fileIdx   int             // Index (0, 1, 2...)
+    prefix    string          // Line prefix ("0> ", "1> ", etc.)
+    currLine  string          // Current buffered line
+    currTime  time.Time       // Parsed timestamp
+    hasTime   bool            // Whether timestamp was found
+    exhausted bool            // EOF reached
+}
+```
+
+**K-way Merge Algorithm:**
+1. Open all files, read first line from each
+2. Pick stream with oldest timestamp (or no timestamp = priority)
+3. Add line to viewer, advance that stream
+4. Repeat until all streams exhausted
+
+### Follow Mode
+
+When `follow=true` (via `-f` flag or `F` key):
+- Background goroutine polls file every 100ms
+- New lines are appended to viewer
+- If user is at bottom, auto-scrolls to show new content
+- Stops following if user scrolls up
+
+### Visual Mode
+
+Activated by pressing `v`:
+- `visualStart`: Line where selection began
+- `visualCursor`: Current cursor position
+- Navigation moves cursor, window scrolls when cursor hits edges
+- `y` yanks (copies) selected lines to clipboard via `pbcopy`/`xclip`
+
+### Timestamp Search
+
+- `t` sets `timestampFormat` (Python datetime syntax)
+- `b` prompts for timestamp (`[yymmdd]hhmmss`)
+- Auto-detects format from common patterns if not set
+- Jumps to first line with timestamp >= input
+
+### Sticky Left Columns
+
+When `stickyLeft > 0`:
+- First N characters always visible when scrolling horizontally
+- Displayed in pastel blue color
+- Useful for keeping timestamps visible while viewing long lines| `version` | "1.0.0" | Application version |
+
+---
+
+## Additional Features
+
+### Multi-File Support
+
+When multiple files are passed as arguments, they are merged by timestamp:
+
+```go
+type fileStream struct {
+    scanner   *bufio.Scanner  // File scanner
+    file      *os.File        // Open file handle
+    fileIdx   int             // Index (0, 1, 2...)
+    prefix    string          // Line prefix ("0> ", "1> ", etc.)
+    currLine  string          // Current buffered line
+    currTime  time.Time       // Parsed timestamp
+    hasTime   bool            // Whether timestamp was found
+    exhausted bool            // EOF reached
+}
+```
+
+**K-way Merge Algorithm:**
+1. Open all files, read first line from each
+2. Pick stream with oldest timestamp (or no timestamp = priority)
+3. Add line to viewer, advance that stream
+4. Repeat until all streams exhausted
+
+### Follow Mode
+
+When `follow=true` (via `-f` flag or `F` key):
+- Background goroutine polls file every 100ms
+- New lines are appended to viewer
+- If user is at bottom, auto-scrolls to show new content
+- Stops following if user scrolls up
+
+### Visual Mode
+
+Activated by pressing `v`:
+- `visualStart`: Line where selection began
+- `visualCursor`: Current cursor position
+- Navigation moves cursor, window scrolls when cursor hits edges
+- `y` yanks (copies) selected lines to clipboard via `pbcopy`/`xclip`
+
+### Timestamp Search
+
+- `t` sets `timestampFormat` (Python datetime syntax)
+- `b` prompts for timestamp (`[yymmdd]hhmmss`)
+- Auto-detects format from common patterns if not set
+- Jumps to first line with timestamp >= input
+
+### Sticky Left Columns
+
+When `stickyLeft > 0`:
+- First N characters always visible when scrolling horizontally
+- Displayed in pastel blue color
+- Useful for keeping timestamps visible while viewing long lines
