@@ -254,6 +254,7 @@ type Viewer struct {
 	filename         string       // Original filename (empty for filtered views)
 	wordWrap         bool         // Word wrap mode
 	jsonPretty       bool         // JSON pretty-print mode
+	stickyLeft       int          // Number of chars to keep visible on left when scrolling (0 = disabled)
 	topLine          int          // Index of the line at the top of the screen
 	topLineOffset    int          // Offset within expanded line (for wrap/JSON mode)
 	leftCol          int          // Horizontal scroll offset
@@ -656,6 +657,9 @@ func (v *Viewer) drawStatusBarWithDepth(depth int) {
 	}
 	if v.jsonPretty {
 		modeStr += " [json]"
+	}
+	if v.stickyLeft > 0 {
+		modeStr += fmt.Sprintf(" [K:%d]", v.stickyLeft)
 	}
 
 	var status string
@@ -1174,6 +1178,7 @@ func (a *App) ShowHelp() {
 		{"Other", []helpEntry{
 			{"w", "Toggle wrap"},
 			{"f", "Toggle JSON"},
+			{"K", "Sticky left cols"},
 			{";", "Export to file"},
 			{"H / F1", "This help"},
 			{"q / Esc", "Quit"},
@@ -1591,6 +1596,32 @@ func (a *App) HandleExport() {
 	a.ShowTempMessage(fmt.Sprintf("Saved %d lines to %s", len(lines), filename))
 }
 
+// HandleStickyLeft prompts for the number of sticky left columns
+func (a *App) HandleStickyLeft() {
+	current := a.stack.Current()
+	input, ok := current.promptForInput("K (sticky cols): ")
+	if !ok {
+		return
+	}
+	if input == "" {
+		// Empty input disables the feature
+		current.stickyLeft = 0
+		a.ShowTempMessage("Sticky left disabled")
+		return
+	}
+	num, err := strconv.Atoi(input)
+	if err != nil || num < 0 {
+		a.ShowTempMessage("Invalid number")
+		return
+	}
+	current.stickyLeft = num
+	if num > 0 {
+		a.ShowTempMessage(fmt.Sprintf("Sticky left: %d chars", num))
+	} else {
+		a.ShowTempMessage("Sticky left disabled")
+	}
+}
+
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
@@ -1729,6 +1760,16 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 	lineIndex := current.topLine
 	skipRows := current.topLineOffset // Skip this many rows at start
 
+	// Pastel blue color (using 256-color mode: color 117 is a light blue)
+	stickyFg := termbox.Attribute(117 + 1) // +1 because termbox uses 1-indexed colors
+
+	// Calculate effective sticky columns
+	stickyActive := current.stickyLeft > 0
+	stickyWidth := current.stickyLeft
+	if stickyActive && stickyWidth > current.width/2 {
+		stickyWidth = current.width / 2 // Cap at half screen
+	}
+
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
 
@@ -1753,20 +1794,59 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 			matchPositions := a.getMatchPositions(cells)
 
 			screenX := 0
-			for i, cell := range cells {
-				if i < current.leftCol {
-					continue
+
+			if stickyActive {
+				// Draw sticky left columns in pastel blue
+				for i := 0; i < stickyWidth && i < len(cells); i++ {
+					if screenX >= current.width {
+						break
+					}
+					fg := stickyFg
+					bg := termbox.ColorDefault
+					// Preserve search highlighting even in sticky area
+					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
+						fg = termbox.ColorBlack
+						bg = termbox.ColorYellow
+					}
+					termbox.SetCell(screenX, screenY, cells[i].char, fg, bg)
+					screenX++
 				}
-				if screenX >= current.width {
-					break
+
+
+				// Draw the rest of the line starting from leftCol (or after sticky if not scrolled)
+				startCol := current.leftCol
+				if current.leftCol == 0 {
+					startCol = stickyWidth // Skip sticky chars that were already drawn
 				}
-				fg, bg := cell.fg, cell.bg
-				if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
-					fg = termbox.ColorBlack
-					bg = termbox.ColorYellow
+				for i := startCol; i < len(cells); i++ {
+					if screenX >= current.width {
+						break
+					}
+					fg, bg := cells[i].fg, cells[i].bg
+					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
+						fg = termbox.ColorBlack
+						bg = termbox.ColorYellow
+					}
+					termbox.SetCell(screenX, screenY, cells[i].char, fg, bg)
+					screenX++
 				}
-				termbox.SetCell(screenX, screenY, cell.char, fg, bg)
-				screenX++
+			} else {
+				// Normal rendering (no sticky)
+				for i, cell := range cells {
+					if i < current.leftCol {
+						continue
+					}
+					if screenX >= current.width {
+						break
+					}
+					fg, bg := cell.fg, cell.bg
+					if matchPositions != nil && i < len(matchPositions) && matchPositions[i] {
+						fg = termbox.ColorBlack
+						bg = termbox.ColorYellow
+					}
+					termbox.SetCell(screenX, screenY, cell.char, fg, bg)
+					screenX++
+				}
 			}
 			screenY++
 		}
@@ -1971,6 +2051,8 @@ func (v *Viewer) run() error {
 					current.navigateRight(1)
 				case '<':
 					current.navigateLeft(1)
+				case 'K':
+					app.HandleStickyLeft()
 				}
 			} else {
 				switch ev.Key {
