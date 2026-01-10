@@ -641,10 +641,10 @@ func (v *Viewer) draw() {
 }
 
 func (v *Viewer) drawStatusBar() {
-	v.drawStatusBarWithDepth(1)
+	v.drawStatusBarWithDepth(1, v.topLine, v.LineCount())
 }
 
-func (v *Viewer) drawStatusBarWithDepth(depth int) {
+func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) {
 	statusY := v.height
 	lineCount := v.LineCount()
 	loadingStr := ""
@@ -664,11 +664,12 @@ func (v *Viewer) drawStatusBarWithDepth(depth int) {
 
 	var status string
 	if depth > 1 {
-		status = fmt.Sprintf(" Line %d/%d | Col %d | Depth %d%s%s | ^U:back =:reset q:quit ",
-			v.topLine+1, lineCount, v.leftCol, depth, modeStr, loadingStr)
+		// Show both current line and original line number
+		status = fmt.Sprintf(" Line %d/%d | Original %d/%d | Col %d%s%s | Depth %d%s%s | q:quit ",
+			v.topLine+1, lineCount, origLine+1, origTotal, v.leftCol, modeStr, loadingStr, depth, modeStr, loadingStr)
 	} else {
-		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Press 'q' to quit ",
-			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr)
+		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Depth %d%s%s | q:quit ",
+			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr, depth, modeStr, loadingStr)
 	}
 
 	// Clear the status line first
@@ -1749,7 +1750,16 @@ func (a *App) Draw() {
 		current.showMessage(a.statusMessage)
 	} else {
 		a.statusMessage = ""
-		current.drawStatusBarWithDepth(len(a.stack.viewers))
+		// Calculate original line number by tracing through the stack
+		origLine := current.topLine
+		for i := len(a.stack.viewers) - 1; i >= 1; i-- {
+			v := a.stack.viewers[i]
+			if len(v.originIndices) > 0 && origLine < len(v.originIndices) {
+				origLine = v.originIndices[origLine]
+			}
+		}
+		origTotal := a.stack.viewers[0].LineCount()
+		current.drawStatusBarWithDepth(len(a.stack.viewers), origLine, origTotal)
 		termbox.Flush()
 	}
 }
