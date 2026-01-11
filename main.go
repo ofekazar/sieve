@@ -201,6 +201,16 @@ func findJSONEnd(line string, jsonStart int) int {
 	return -1
 }
 
+// lineHasANSI quickly checks if a line contains ANSI escape codes
+func lineHasANSI(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b {
+			return true
+		}
+	}
+	return false
+}
+
 // stripANSI removes ANSI escape codes from a string
 func stripANSI(s string) string {
 	var result strings.Builder
@@ -325,6 +335,7 @@ func isJSON(line string) bool {
 
 type Viewer struct {
 	lines            []string     // All lines from the file
+	hasANSI          []bool       // True if corresponding line has ANSI escape codes
 	originIndices    []int        // Maps each line to its index in parent viewer (for filtered views)
 	mu               sync.RWMutex // Protects lines during background loading
 	loading          bool         // True while file is still loading
@@ -573,7 +584,8 @@ func (s *SearchState) Prev() int {
 
 // Search performs a search starting from startLine, returns the first match line index or -1
 // If backward is true, searches upward; otherwise searches downward
-func (s *SearchState) Search(lines []string, query string, startLine int, backward bool, isRegex bool, ignoreCase bool) int {
+// hasANSI is optional cache of which lines have ANSI codes (pass nil to always strip)
+func (s *SearchState) Search(lines []string, hasANSI []bool, query string, startLine int, backward bool, isRegex bool, ignoreCase bool) int {
 	s.query = query
 	s.isRegex = isRegex
 	s.ignoreCase = ignoreCase
@@ -582,10 +594,18 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 	s.backward = backward
 	s.regex = nil
 
+	// Helper to get plain text (only strip if has ANSI codes)
+	getPlain := func(i int, line string) string {
+		if hasANSI != nil && i < len(hasANSI) && !hasANSI[i] {
+			return line // No ANSI codes, use as-is
+		}
+		return stripANSI(line)
+	}
+
 	// Fast path: literal case-sensitive search using strings.Contains
 	if !isRegex && !ignoreCase {
 		for i, line := range lines {
-			plainLine := stripANSI(line)
+			plainLine := getPlain(i, line)
 			if strings.Contains(plainLine, query) {
 				s.matches = append(s.matches, i)
 			}
@@ -594,7 +614,7 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 		// Case-insensitive literal search
 		lowerQuery := strings.ToLower(query)
 		for i, line := range lines {
-			plainLine := stripANSI(line)
+			plainLine := getPlain(i, line)
 			if strings.Contains(strings.ToLower(plainLine), lowerQuery) {
 				s.matches = append(s.matches, i)
 			}
@@ -613,7 +633,7 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 		s.regex = re
 
 		for i, line := range lines {
-			plainLine := stripANSI(line)
+			plainLine := getPlain(i, line)
 			if s.regex.MatchString(plainLine) {
 				s.matches = append(s.matches, i)
 			}
@@ -697,10 +717,13 @@ func (v *Viewer) followFile(filename string) {
 
 		lineNum := 0
 		var newLines []string
+		var newHasANSI []bool
 		for scanner.Scan() {
 			lineNum++
 			if lineNum > currentLines {
-				newLines = append(newLines, scanner.Text())
+				line := scanner.Text()
+				newLines = append(newLines, line)
+				newHasANSI = append(newHasANSI, lineHasANSI(line))
 			}
 		}
 		file.Close()
@@ -713,6 +736,7 @@ func (v *Viewer) followFile(filename string) {
 
 			v.mu.Lock()
 			v.lines = append(v.lines, newLines...)
+			v.hasANSI = append(v.hasANSI, newHasANSI...)
 			if atBottom {
 				// Auto-scroll to bottom
 				v.topLine = len(v.lines) - v.height
@@ -753,17 +777,22 @@ func loadFromReader(v *Viewer, r io.Reader) {
 
 	const batchSize = 10000
 	batch := make([]string, 0, batchSize)
+	batchHasANSI := make([]bool, 0, batchSize)
 	totalLines := 0
 
 	for scanner.Scan() {
-		batch = append(batch, scanner.Text())
+		line := scanner.Text()
+		batch = append(batch, line)
+		batchHasANSI = append(batchHasANSI, lineHasANSI(line))
 
 		if len(batch) >= batchSize {
 			v.mu.Lock()
 			v.lines = append(v.lines, batch...)
+			v.hasANSI = append(v.hasANSI, batchHasANSI...)
 			v.mu.Unlock()
 			totalLines += len(batch)
 			batch = batch[:0]
+			batchHasANSI = batchHasANSI[:0]
 
 			// Only interrupt for first batch (to show content quickly) and then sparingly
 			if totalLines == batchSize || totalLines%100000 == 0 {
@@ -776,6 +805,7 @@ func loadFromReader(v *Viewer, r io.Reader) {
 	if len(batch) > 0 {
 		v.mu.Lock()
 		v.lines = append(v.lines, batch...)
+		v.hasANSI = append(v.hasANSI, batchHasANSI...)
 		v.mu.Unlock()
 	}
 
@@ -787,8 +817,13 @@ func loadFromReader(v *Viewer, r io.Reader) {
 
 // NewViewerFromLines creates a Viewer from an existing slice of lines
 func NewViewerFromLines(lines []string) *Viewer {
+	hasANSI := make([]bool, len(lines))
+	for i, line := range lines {
+		hasANSI[i] = lineHasANSI(line)
+	}
 	return &Viewer{
 		lines:    lines,
+		hasANSI:  hasANSI,
 		loading:  false,
 		filename: "", // empty for test viewers
 		topLine:  0,
@@ -819,6 +854,15 @@ func (v *Viewer) GetLines() []string {
 	defer v.mu.RUnlock()
 	result := make([]string, len(v.lines))
 	copy(result, v.lines)
+	return result
+}
+
+// GetHasANSI returns a copy of hasANSI slice (thread-safe)
+func (v *Viewer) GetHasANSI() []bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	result := make([]bool, len(v.hasANSI))
+	copy(result, v.hasANSI)
 	return result
 }
 
@@ -1925,7 +1969,8 @@ func (a *App) ClearMessage() {
 type filterChunkResult struct {
 	chunkIdx int
 	lines    []string
-	indices  []int // Original line indices
+	hasANSI  []bool // Whether each line has ANSI codes
+	indices  []int  // Original line indices
 }
 
 // HandleFilter filters lines based on query
@@ -1941,10 +1986,11 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptForFilter(prompt)
 	if ok && query != "" {
-		lines := current.GetLines() // Get snapshot for thread-safety
+		lines := current.GetLines()       // Get snapshot for thread-safety
+		hasANSICache := current.GetHasANSI() // Get ANSI cache
 
-		// Compile matcher based on options
-		var matcher func(string) bool
+		// Compile matcher based on options (uses index to check hasANSI cache)
+		var matcher func(line string, hasANSI bool) bool
 		if isRegex {
 			pattern := query
 			if ignoreCase {
@@ -1955,17 +2001,26 @@ func (a *App) HandleFilter(keep bool) {
 				a.ShowTempMessage("Invalid regex: " + err.Error())
 				return
 			}
-			matcher = func(line string) bool {
-				return re.MatchString(stripANSI(line))
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return re.MatchString(stripANSI(line))
+				}
+				return re.MatchString(line)
 			}
 		} else if ignoreCase {
 			queryLower := strings.ToLower(query)
-			matcher = func(line string) bool {
-				return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
+				}
+				return strings.Contains(strings.ToLower(line), queryLower)
 			}
 		} else {
-			matcher = func(line string) bool {
-				return strings.Contains(stripANSI(line), query)
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return strings.Contains(stripANSI(line), query)
+				}
+				return strings.Contains(line, query)
 			}
 		}
 
@@ -2004,15 +2059,18 @@ func (a *App) HandleFilter(keep bool) {
 
 				go func(chunkIdx, start, end int) {
 					var chunkLines []string
+					var chunkHasANSI []bool
 					var chunkIndices []int
 					for i := start; i < end; i++ {
-						matches := matcher(lines[i])
+						has := i < len(hasANSICache) && hasANSICache[i]
+						matches := matcher(lines[i], has)
 						if matches == keep {
 							chunkLines = append(chunkLines, lines[i])
+							chunkHasANSI = append(chunkHasANSI, has)
 							chunkIndices = append(chunkIndices, i)
 						}
 					}
-					resultChan <- filterChunkResult{chunkIdx, chunkLines, chunkIndices}
+					resultChan <- filterChunkResult{chunkIdx, chunkLines, chunkHasANSI, chunkIndices}
 				}(w, start, end)
 			}
 
@@ -2042,16 +2100,19 @@ func (a *App) HandleFilter(keep bool) {
 			matchesBefore := 0
 			lineCount := 0
 			var allIndices []int
+			var allHasANSI []bool
 
 			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
 				chunk := results[chunkIdx]
 				for j, line := range chunk.lines {
 					newViewer.mu.Lock()
 					newViewer.lines = append(newViewer.lines, line)
+					newViewer.hasANSI = append(newViewer.hasANSI, chunk.hasANSI[j])
 					newViewer.mu.Unlock()
 
 					origIdx := chunk.indices[j]
 					allIndices = append(allIndices, origIdx)
+					allHasANSI = append(allHasANSI, chunk.hasANSI[j])
 
 					if origIdx >= currentTopLine && !foundMatch {
 						foundMatch = true
@@ -2087,9 +2148,10 @@ func (a *App) HandleFilterAppend() {
 		original := a.stack.viewers[0]
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
+		originalHasANSI := original.GetHasANSI()
 
-		// Compile matcher based on options
-		var matcher func(string) bool
+		// Compile matcher based on options (uses hasANSI flag)
+		var matcher func(line string, hasANSI bool) bool
 		if isRegex {
 			pattern := query
 			if ignoreCase {
@@ -2100,17 +2162,26 @@ func (a *App) HandleFilterAppend() {
 				a.ShowTempMessage("Invalid regex: " + err.Error())
 				return
 			}
-			matcher = func(line string) bool {
-				return re.MatchString(stripANSI(line))
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return re.MatchString(stripANSI(line))
+				}
+				return re.MatchString(line)
 			}
 		} else if ignoreCase {
 			queryLower := strings.ToLower(query)
-			matcher = func(line string) bool {
-				return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
+				}
+				return strings.Contains(strings.ToLower(line), queryLower)
 			}
 		} else {
-			matcher = func(line string) bool {
-				return strings.Contains(stripANSI(line), query)
+			matcher = func(line string, hasANSI bool) bool {
+				if hasANSI {
+					return strings.Contains(stripANSI(line), query)
+				}
+				return strings.Contains(line, query)
 			}
 		}
 
@@ -2146,6 +2217,7 @@ func (a *App) HandleFilterAppend() {
 			type appendChunkResult struct {
 				chunkIdx int
 				lines    []string
+				hasANSI  []bool
 				indices  []int
 			}
 			resultChan := make(chan appendChunkResult, numWorkers)
@@ -2177,14 +2249,17 @@ func (a *App) HandleFilterAppend() {
 
 				go func(chunkIdx, start, end int) {
 					var chunkLines []string
+					var chunkHasANSI []bool
 					var chunkIndices []int
 					for i := start; i < end; i++ {
-						if inCurrent[i] || matcher(originalLines[i]) {
+						has := i < len(originalHasANSI) && originalHasANSI[i]
+						if inCurrent[i] || matcher(originalLines[i], has) {
 							chunkLines = append(chunkLines, originalLines[i])
+							chunkHasANSI = append(chunkHasANSI, has)
 							chunkIndices = append(chunkIndices, i)
 						}
 					}
-					resultChan <- appendChunkResult{chunkIdx, chunkLines, chunkIndices}
+					resultChan <- appendChunkResult{chunkIdx, chunkLines, chunkHasANSI, chunkIndices}
 				}(w, start, end)
 			}
 
@@ -2210,6 +2285,7 @@ func (a *App) HandleFilterAppend() {
 				for j, line := range chunk.lines {
 					newViewer.mu.Lock()
 					newViewer.lines = append(newViewer.lines, line)
+					newViewer.hasANSI = append(newViewer.hasANSI, chunk.hasANSI[j])
 					if !foundCurrentLine && line == currentLine {
 						foundCurrentLine = true
 						newViewer.topLine = len(newViewer.lines) - 1
@@ -2333,7 +2409,8 @@ func (a *App) HandleSearch(backward bool) {
 	query, isRegex, ignoreCase, ok := a.promptForSearch(prompt)
 	if ok && query != "" {
 		lines := current.GetLines()
-		lineIdx := a.search.Search(lines, query, current.topLine, backward, isRegex, ignoreCase)
+		hasANSI := current.GetHasANSI()
+		lineIdx := a.search.Search(lines, hasANSI, query, current.topLine, backward, isRegex, ignoreCase)
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
@@ -3018,6 +3095,7 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 		// K-way merge: always pick the stream with the oldest timestamp
 		const batchSize = 10000
 		batch := make([]string, 0, batchSize)
+		batchHasANSI := make([]bool, 0, batchSize)
 		totalLines := 0
 
 		for {
@@ -3051,6 +3129,7 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 
 			// Add the picked line to batch
 			batch = append(batch, picked.currLine)
+			batchHasANSI = append(batchHasANSI, lineHasANSI(picked.currLine))
 
 			// Advance that stream to its next line
 			if picked.scanner.Scan() {
@@ -3073,9 +3152,11 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 			if len(batch) >= batchSize {
 				v.mu.Lock()
 				v.lines = append(v.lines, batch...)
+				v.hasANSI = append(v.hasANSI, batchHasANSI...)
 				v.mu.Unlock()
 				totalLines += len(batch)
 				batch = batch[:0]
+				batchHasANSI = batchHasANSI[:0]
 
 				if totalLines == batchSize || totalLines%100000 == 0 {
 					termbox.Interrupt()
@@ -3087,6 +3168,7 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 		if len(batch) > 0 {
 			v.mu.Lock()
 			v.lines = append(v.lines, batch...)
+			v.hasANSI = append(v.hasANSI, batchHasANSI...)
 			v.mu.Unlock()
 		}
 
