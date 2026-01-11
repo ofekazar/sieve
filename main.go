@@ -966,17 +966,21 @@ func (v *Viewer) draw() {
 	termbox.Flush()
 }
 
-func (v *Viewer) drawStatusBar() {
-	v.drawStatusBarWithDepth(1, v.topLine, v.LineCount())
+// drawStatusText clears the status line and draws text (used by multiple status bar functions)
+func drawStatusText(width, statusY int, text string) {
+	for i := 0; i < width; i++ {
+		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+	}
+	for i, char := range text {
+		if i >= width {
+			break
+		}
+		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+	}
 }
 
-func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) {
-	statusY := v.height
-	lineCount := v.LineCount()
-	loadingStr := ""
-	if v.IsLoading() {
-		loadingStr = " [loading...]"
-	}
+// buildModeStr returns the mode indicators string
+func (v *Viewer) buildModeStr() string {
 	modeStr := ""
 	if v.follow {
 		modeStr += " [follow]"
@@ -993,37 +997,39 @@ func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) 
 	if v.stickyLeft > 0 {
 		modeStr += fmt.Sprintf(" [K:%d]", v.stickyLeft)
 	}
+	return modeStr
+}
+
+func (v *Viewer) drawStatusBar() {
+	v.drawStatusBarWithDepth(1, v.topLine, v.LineCount())
+}
+
+func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) {
+	lineCount := v.LineCount()
+	loadingStr := ""
+	if v.IsLoading() {
+		loadingStr = " [loading...]"
+	}
+	modeStr := v.buildModeStr()
 
 	var status string
 	if depth > 1 {
-		// Show both current line and original line number
-		status = fmt.Sprintf(" Line %d/%d | Original %d/%d | Col %d%s%s | Depth %d%s%s | q:quit ",
-			v.topLine+1, lineCount, origLine+1, origTotal, v.leftCol, modeStr, loadingStr, depth, modeStr, loadingStr)
+		status = fmt.Sprintf(" Line %d/%d | Original %d/%d | Col %d%s%s | Depth %d | q:quit ",
+			v.topLine+1, lineCount, origLine+1, origTotal, v.leftCol, modeStr, loadingStr, depth)
 	} else {
-		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Depth %d%s%s | q:quit ",
-			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr, depth, modeStr, loadingStr)
+		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Depth %d | q:quit ",
+			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr, depth)
 	}
 
-	// Clear the status line first
-	for i := 0; i < v.width; i++ {
-		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
-	}
-
-	// Draw left-aligned status
-	for i, char := range status {
-		if i >= v.width {
-			break
-		}
-		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
-	}
+	drawStatusText(v.width, v.height, status)
 
 	// Draw right-aligned filename
 	if v.filename != "" {
 		filenameDisplay := " " + v.filename + " "
 		startX := v.width - len([]rune(filenameDisplay))
-		if startX > len(status) { // Only if there's room
+		if startX > len(status) {
 			for i, char := range filenameDisplay {
-				termbox.SetCell(startX+i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+				termbox.SetCell(startX+i, v.height, char, termbox.ColorBlack, termbox.ColorWhite)
 			}
 		}
 	}
@@ -1031,63 +1037,23 @@ func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) 
 
 // showMessage displays a message on the status bar
 func (v *Viewer) showMessage(msg string) {
-	statusY := v.height
-
-	// Clear the status line first
-	for i := 0; i < v.width; i++ {
-		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
-	}
-
-	for i, char := range msg {
-		if i >= v.width {
-			break
-		}
-		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
-	}
+	drawStatusText(v.width, v.height, msg)
 	termbox.Flush()
 }
 
 // drawVisualStatusBar draws the status bar in visual mode
 func (a *App) drawVisualStatusBar(v *Viewer, status string) {
-	statusY := v.height
-
-	// Clear the status line
-	for i := 0; i < v.width; i++ {
-		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
-	}
-
-	for i, char := range status {
-		if i >= v.width {
-			break
-		}
-		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
-	}
+	drawStatusText(v.width, v.height, status)
 }
 
 // drawStatusBarWithSearch draws the status bar including search info
 func (a *App) drawStatusBarWithSearch(v *Viewer, depth int, origLine int, origTotal int, searchInfo string) {
-	statusY := v.height
 	lineCount := v.LineCount()
 	loadingStr := ""
 	if v.IsLoading() {
 		loadingStr = " [loading...]"
 	}
-	modeStr := ""
-	if v.follow {
-		modeStr += " [follow]"
-	}
-	if v.wordWrap {
-		modeStr += " [wrap]"
-	}
-	if v.jsonPretty {
-		modeStr += " [json]"
-	}
-	if v.showLineNumbers {
-		modeStr += " [ln]"
-	}
-	if v.stickyLeft > 0 {
-		modeStr += fmt.Sprintf(" [K:%d]", v.stickyLeft)
-	}
+	modeStr := v.buildModeStr()
 
 	var status string
 	if depth > 1 {
@@ -1098,18 +1064,7 @@ func (a *App) drawStatusBarWithSearch(v *Viewer, depth int, origLine int, origTo
 			v.topLine+1, lineCount, searchInfo, v.leftCol, modeStr, loadingStr, depth)
 	}
 
-	// Clear the status line first
-	for i := 0; i < v.width; i++ {
-		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
-	}
-
-	// Draw left-aligned status
-	for i, char := range status {
-		if i >= v.width {
-			break
-		}
-		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
-	}
+	drawStatusText(v.width, v.height, status)
 
 	// Draw right-aligned filename
 	if v.filename != "" {
@@ -1117,7 +1072,7 @@ func (a *App) drawStatusBarWithSearch(v *Viewer, depth int, origLine int, origTo
 		startX := v.width - len([]rune(filenameDisplay))
 		if startX > len(status) {
 			for i, char := range filenameDisplay {
-				termbox.SetCell(startX+i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+				termbox.SetCell(startX+i, v.height, char, termbox.ColorBlack, termbox.ColorWhite)
 			}
 		}
 	}
@@ -1340,9 +1295,9 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 	}
 }
 
-// promptForSearch prompts for search input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
+// promptWithModifiers prompts for input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
 // Returns: input string, isRegex flag, ignoreCase flag, ok
-func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
+func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
 	v := a.stack.Current()
 	a.history.Reset()
 	input := ""
@@ -1350,7 +1305,6 @@ func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
 	ignoreCase := false
 
 	for {
-		// Draw the prompt line at the bottom
 		statusY := v.height
 		indicators := ""
 		if isRegex {
@@ -1367,25 +1321,19 @@ func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
 		}
 		line := prompt + indicators + input
 
-		// Clear the status line first
 		for i := 0; i < v.width; i++ {
 			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
 		}
-
-		// Draw the prompt and input
 		for i, char := range line {
 			if i >= v.width {
 				break
 			}
 			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
 		}
-
-		// Position cursor after input
 		cursorPos := len([]rune(line))
 		if cursorPos < v.width {
 			termbox.SetCursor(cursorPos, statusY)
 		}
-
 		termbox.Flush()
 
 		ev := termbox.PollEvent()
@@ -1424,20 +1372,6 @@ func (a *App) promptForSearch(prompt string) (string, bool, bool, bool) {
 			v.draw()
 		}
 	}
-}
-
-// filterLines returns lines based on query match
-// If keep is true, returns lines containing query; if false, returns lines NOT containing query
-// filterLinesSlice filters a slice of lines based on query match
-func filterLinesSlice(lines []string, query string, keep bool) []string {
-	var filtered []string
-	for _, line := range lines {
-		matches := strings.Contains(line, query)
-		if matches == keep {
-			filtered = append(filtered, line)
-		}
-	}
-	return filtered
 }
 
 // NewViewerStack creates a new ViewerStack with the initial viewer
@@ -1481,85 +1415,6 @@ func NewApp(viewer *Viewer) *App {
 		stack:   NewViewerStack(viewer),
 		search:  &SearchState{},
 		history: NewHistory("/tmp/sieve_history"),
-	}
-}
-
-// promptForFilter prompts for filter input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
-// Returns: input string, isRegex flag, ignoreCase flag, ok
-func (a *App) promptForFilter(prompt string) (string, bool, bool, bool) {
-	v := a.stack.Current()
-	a.history.Reset()
-	input := ""
-	isRegex := false
-	ignoreCase := false
-
-	for {
-		statusY := v.height
-		indicators := ""
-		if isRegex {
-			indicators += "[regex]"
-		}
-		if ignoreCase {
-			if indicators != "" {
-				indicators += " "
-			}
-			indicators += "[nocase]"
-		}
-		if indicators != "" {
-			indicators += " "
-		}
-		line := prompt + indicators + input
-
-		for i := 0; i < v.width; i++ {
-			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
-		}
-		for i, char := range line {
-			if i >= v.width {
-				break
-			}
-			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
-		}
-		cursorPos := len([]rune(line))
-		if cursorPos < v.width {
-			termbox.SetCursor(cursorPos, statusY)
-		}
-		termbox.Flush()
-
-		ev := termbox.PollEvent()
-		switch ev.Type {
-		case termbox.EventKey:
-			if ev.Key == termbox.KeyEnter {
-				termbox.HideCursor()
-				if input != "" {
-					a.history.AddWithModifiers(input, isRegex, ignoreCase)
-				}
-				return input, isRegex, ignoreCase, true
-			} else if ev.Key == termbox.KeyEsc {
-				termbox.HideCursor()
-				return "", false, false, false
-			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
-				if len(input) > 0 {
-					runes := []rune(input)
-					input = string(runes[:len(runes)-1])
-				}
-			} else if ev.Key == termbox.KeyArrowUp {
-				input, isRegex, ignoreCase = a.history.UpWithModifiers(input, isRegex, ignoreCase)
-			} else if ev.Key == termbox.KeyArrowDown {
-				input, isRegex, ignoreCase = a.history.DownWithModifiers(input, isRegex, ignoreCase)
-			} else if ev.Key == termbox.KeyCtrlR {
-				isRegex = !isRegex
-			} else if ev.Key == termbox.KeyCtrlI {
-				ignoreCase = !ignoreCase
-			} else if ev.Ch != 0 {
-				input += string(ev.Ch)
-			} else if ev.Key == termbox.KeySpace {
-				input += " "
-			}
-		case termbox.EventResize:
-			termbox.Sync()
-			v.resize(ev.Width, ev.Height)
-			v.draw()
-		}
 	}
 }
 
@@ -1660,56 +1515,31 @@ func (a *App) VisualCursorUp() {
 }
 
 // visualScrollIfNeeded scrolls the view to keep visual cursor visible (for wrap/json mode)
+// visualCursorScreenRow calculates the screen row of the visual cursor relative to topLine
+func (a *App) visualCursorScreenRow(current *Viewer) int {
+	if a.visualCursor > current.topLine {
+		row := 0
+		for i := current.topLine; i < a.visualCursor; i++ {
+			row += current.getExpandedLineCount(i)
+		}
+		return row - current.topLineOffset + a.visualCursorOffset
+	} else if a.visualCursor == current.topLine {
+		return a.visualCursorOffset - current.topLineOffset
+	}
+	return -1 // Cursor is above topLine
+}
+
 func (a *App) visualScrollIfNeeded() {
 	current := a.stack.Current()
 
-	// Calculate screen row of cursor relative to topLine
-	cursorScreenRow := 0
-	if a.visualCursor > current.topLine {
-		for i := current.topLine; i < a.visualCursor; i++ {
-			cursorScreenRow += current.getExpandedLineCount(i)
-		}
-		cursorScreenRow -= current.topLineOffset
-		cursorScreenRow += a.visualCursorOffset
-	} else if a.visualCursor == current.topLine {
-		cursorScreenRow = a.visualCursorOffset - current.topLineOffset
-	} else {
-		// Cursor is above topLine, need to scroll up
-		cursorScreenRow = -1
-	}
-
 	// Scroll down if cursor below visible area
-	for cursorScreenRow >= current.height {
+	for a.visualCursorScreenRow(current) >= current.height {
 		current.navigateDown()
-		// Recalculate
-		cursorScreenRow = 0
-		if a.visualCursor > current.topLine {
-			for i := current.topLine; i < a.visualCursor; i++ {
-				cursorScreenRow += current.getExpandedLineCount(i)
-			}
-			cursorScreenRow -= current.topLineOffset
-			cursorScreenRow += a.visualCursorOffset
-		} else if a.visualCursor == current.topLine {
-			cursorScreenRow = a.visualCursorOffset - current.topLineOffset
-		}
 	}
 
 	// Scroll up if cursor above visible area
-	for cursorScreenRow < 0 {
+	for a.visualCursorScreenRow(current) < 0 {
 		current.navigateUp()
-		// Recalculate
-		if a.visualCursor > current.topLine {
-			cursorScreenRow = 0
-			for i := current.topLine; i < a.visualCursor; i++ {
-				cursorScreenRow += current.getExpandedLineCount(i)
-			}
-			cursorScreenRow -= current.topLineOffset
-			cursorScreenRow += a.visualCursorOffset
-		} else if a.visualCursor == current.topLine {
-			cursorScreenRow = a.visualCursorOffset - current.topLineOffset
-		} else {
-			cursorScreenRow = -1
-		}
 	}
 }
 
@@ -2276,6 +2106,41 @@ type filterChunkResult struct {
 	indices  []int  // Original line indices
 }
 
+// createMatcher creates a matcher function based on search options
+// Returns matcher function and error (if regex is invalid)
+func createMatcher(query string, isRegex, ignoreCase bool) (func(line string, hasANSI bool) bool, error) {
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, err
+		}
+		return func(line string, hasANSI bool) bool {
+			if hasANSI {
+				return re.MatchString(stripANSI(line))
+			}
+			return re.MatchString(line)
+		}, nil
+	} else if ignoreCase {
+		queryLower := strings.ToLower(query)
+		return func(line string, hasANSI bool) bool {
+			if hasANSI {
+				return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
+			}
+			return strings.Contains(strings.ToLower(line), queryLower)
+		}, nil
+	}
+	return func(line string, hasANSI bool) bool {
+		if hasANSI {
+			return strings.Contains(stripANSI(line), query)
+		}
+		return strings.Contains(line, query)
+	}, nil
+}
+
 // HandleFilter filters lines based on query
 // If keep is true (&), keeps matching lines; if false (-), excludes matching lines
 func (a *App) HandleFilter(keep bool) {
@@ -2287,44 +2152,15 @@ func (a *App) HandleFilter(keep bool) {
 		prompt = "-"
 	}
 
-	query, isRegex, ignoreCase, ok := a.promptForFilter(prompt)
+	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
 		lines := current.GetLines()       // Get snapshot for thread-safety
 		hasANSICache := current.GetHasANSI() // Get ANSI cache
 
-		// Compile matcher based on options (uses index to check hasANSI cache)
-		var matcher func(line string, hasANSI bool) bool
-		if isRegex {
-			pattern := query
-			if ignoreCase {
-				pattern = "(?i)" + pattern
-			}
-			re, err := regexp.Compile(pattern)
-			if err != nil {
-				a.ShowTempMessage("Invalid regex: " + err.Error())
-				return
-			}
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return re.MatchString(stripANSI(line))
-				}
-				return re.MatchString(line)
-			}
-		} else if ignoreCase {
-			queryLower := strings.ToLower(query)
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
-				}
-				return strings.Contains(strings.ToLower(line), queryLower)
-			}
-		} else {
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return strings.Contains(stripANSI(line), query)
-				}
-				return strings.Contains(line, query)
-			}
+		matcher, err := createMatcher(query, isRegex, ignoreCase)
+		if err != nil {
+			a.ShowTempMessage("Invalid regex: " + err.Error())
+			return
 		}
 
 		// Create new viewer immediately with loading state
@@ -2446,46 +2282,17 @@ func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
 	currentLine := current.GetLine(current.topLine)
 
-	query, isRegex, ignoreCase, ok := a.promptForFilter("+")
+	query, isRegex, ignoreCase, ok := a.promptWithModifiers("+")
 	if ok && query != "" {
 		original := a.stack.viewers[0]
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
 		originalHasANSI := original.GetHasANSI()
 
-		// Compile matcher based on options (uses hasANSI flag)
-		var matcher func(line string, hasANSI bool) bool
-		if isRegex {
-			pattern := query
-			if ignoreCase {
-				pattern = "(?i)" + pattern
-			}
-			re, err := regexp.Compile(pattern)
-			if err != nil {
-				a.ShowTempMessage("Invalid regex: " + err.Error())
-				return
-			}
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return re.MatchString(stripANSI(line))
-				}
-				return re.MatchString(line)
-			}
-		} else if ignoreCase {
-			queryLower := strings.ToLower(query)
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
-				}
-				return strings.Contains(strings.ToLower(line), queryLower)
-			}
-		} else {
-			matcher = func(line string, hasANSI bool) bool {
-				if hasANSI {
-					return strings.Contains(stripANSI(line), query)
-				}
-				return strings.Contains(line, query)
-			}
+		matcher, err := createMatcher(query, isRegex, ignoreCase)
+		if err != nil {
+			a.ShowTempMessage("Invalid regex: " + err.Error())
+			return
 		}
 
 		// Create new viewer immediately with loading state
@@ -2709,7 +2516,7 @@ func (a *App) HandleSearch(backward bool) {
 		noMatchMsg = "BOF - no more matches"
 	}
 
-	query, isRegex, ignoreCase, ok := a.promptForSearch(prompt)
+	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
 		lines := current.GetLines()
 		hasANSI := current.GetHasANSI()
