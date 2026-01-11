@@ -334,21 +334,28 @@ func isJSON(line string) bool {
 }
 
 type Viewer struct {
-	lines            []string     // All lines from the file
-	hasANSI          []bool       // True if corresponding line has ANSI escape codes
-	originIndices    []int        // Maps each line to its index in parent viewer (for filtered views)
-	mu               sync.RWMutex // Protects lines during background loading
-	loading          bool         // True while file is still loading
-	filename         string       // Original filename (empty for filtered views)
-	wordWrap         bool         // Word wrap mode
-	jsonPretty       bool         // JSON pretty-print mode
-	showLineNumbers  bool         // Show line numbers on left side
-	stickyLeft       int          // Number of chars to keep visible on left when scrolling (0 = disabled)
-	topLine          int          // Index of the line at the top of the screen
-	topLineOffset    int          // Offset within expanded line (for wrap/JSON mode)
-	leftCol          int          // Horizontal scroll offset
-	width            int          // Terminal width
-	height           int          // Terminal height
+	// In-memory storage (for small files or non-paged mode)
+	lines   []string     // All lines from the file
+	hasANSI []bool       // True if corresponding line has ANSI escape codes
+	mu      sync.RWMutex // Protects lines during background loading
+
+	// Paging support (for large files > 250MB)
+	paged      bool        // True if using paging mode
+	lineBuffer *LineBuffer // Paged line buffer (when paged)
+
+	// Common fields
+	originIndices    []int  // Maps each line to its index in parent viewer (for filtered views)
+	loading          bool   // True while file is still loading
+	filename         string // Original filename (empty for filtered views)
+	wordWrap         bool   // Word wrap mode
+	jsonPretty       bool   // JSON pretty-print mode
+	showLineNumbers  bool   // Show line numbers on left side
+	stickyLeft       int    // Number of chars to keep visible on left when scrolling (0 = disabled)
+	topLine          int    // Index of the line at the top of the screen
+	topLineOffset    int    // Offset within expanded line (for wrap/JSON mode)
+	leftCol          int    // Horizontal scroll offset
+	width            int    // Terminal width
+	height           int    // Terminal height
 	expandedCache    map[int]int  // Cache of expanded line counts (lineIdx -> rowCount)
 	expandedCacheKey string       // Key to invalidate cache (mode+width)
 	follow           bool         // Follow mode (like tail -f)
@@ -357,6 +364,668 @@ type Viewer struct {
 // ViewerStack manages a stack of viewers for filtering navigation
 type ViewerStack struct {
 	viewers []*Viewer
+}
+
+// ============================================================================
+// Smart Pager - for large file support (>250MB)
+// ============================================================================
+
+const (
+	pagingThresholdBytes = 250 * 1024 * 1024 // 250MB - use paging for files larger than this
+	pageSize             = 10000             // lines per page (10K)
+)
+
+// LineIndex stores byte offsets for all lines without storing content
+type LineIndex struct {
+	offsets    []int64 // byte offset of each line start
+	hasANSI    []bool  // whether each line has ANSI codes
+	totalLines int
+	filename   string
+	isFiltered bool // true if this is a filtered view (non-contiguous offsets)
+}
+
+// buildLineIndex scans a file and builds the line index
+func buildLineIndex(filename string) (*LineIndex, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	idx := &LineIndex{filename: filename}
+
+	// Pre-allocate slices with estimated capacity
+	stat, _ := file.Stat()
+	estimatedLines := int(stat.Size() / 250)
+	if estimatedLines > 0 {
+		if estimatedLines > 10_000_000 {
+			estimatedLines = 10_000_000
+		}
+		idx.offsets = make([]int64, 0, estimatedLines)
+		idx.hasANSI = make([]bool, 0, estimatedLines)
+	}
+
+	// Use ReadBytes to get exact line lengths including newline
+	reader := bufio.NewReader(file)
+	var offset int64
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			idx.offsets = append(idx.offsets, offset)
+			idx.hasANSI = append(idx.hasANSI, bytes.Contains(line, []byte{'\x1b'}))
+			offset += int64(len(line)) // len(line) includes the newline
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	idx.totalLines = len(idx.offsets)
+	return idx, nil
+}
+
+// LineBuffer manages a sliding window of cached lines
+type LineBuffer struct {
+	pages      map[int][]string // pageNum -> lines for that page
+	index      *LineIndex
+	mu         sync.RWMutex
+	centerPage int           // the page around which we keep the buffer
+	loadChan   chan int      // channel to request page loads
+	stopChan   chan struct{} // stop the background loader
+
+	// Result window for filtered views (~1000 lines around current position)
+	// Only used when isFiltered is true
+	resultWindow struct {
+		startIdx int      // First result index in cache
+		endIdx   int      // Last result index in cache (exclusive)
+		lines    []string // Cached lines for resultWindow[startIdx:endIdx]
+	}
+	resultWindowTarget int // Target window size (~1000 lines)
+}
+
+// NewLineBuffer creates a new line buffer for the given index
+func NewLineBuffer(index *LineIndex) (*LineBuffer, error) {
+	lb := &LineBuffer{
+		pages:              make(map[int][]string),
+		index:              index,
+		loadChan:           make(chan int, 100),
+		stopChan:           make(chan struct{}),
+		resultWindowTarget: 1000, // Keep ~1000 lines in memory for filtered views
+	}
+
+	// Start background loader
+	go lb.backgroundLoader()
+
+	// For filtered views, use result windowing instead of page-based loading
+	if index.isFiltered {
+		lb.ensureResultWindow(0)
+	} else {
+		// Preload first pages for original files
+		lb.ensurePagesAround(0)
+	}
+
+	return lb, nil
+}
+
+// Close cleans up resources
+func (lb *LineBuffer) Close() {
+	close(lb.stopChan)
+}
+
+// backgroundLoader processes page load requests
+func (lb *LineBuffer) backgroundLoader() {
+	for {
+		select {
+		case <-lb.stopChan:
+			return
+		case pageNum := <-lb.loadChan:
+			lb.loadPageSync(pageNum)
+		}
+	}
+}
+
+// loadPageSync loads a page synchronously (called from background loader)
+// Uses sequential read from start offset for efficiency with large pages
+func (lb *LineBuffer) loadPageSync(pageNum int) {
+	lb.mu.Lock()
+	if _, exists := lb.pages[pageNum]; exists {
+		lb.mu.Unlock()
+		return
+	}
+	lb.mu.Unlock()
+
+	startLine := pageNum * pageSize
+	endLine := startLine + pageSize
+	if endLine > lb.index.totalLines {
+		endLine = lb.index.totalLines
+	}
+	if startLine >= lb.index.totalLines {
+		return
+	}
+
+	// Open a fresh file handle to avoid race conditions
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	// For filtered views (non-contiguous offsets), we must seek per line
+	if lb.index.isFiltered {
+		lines := make([]string, 0, endLine-startLine)
+		reader := bufio.NewReader(file)
+		for i := startLine; i < endLine; i++ {
+			offset := lb.index.offsets[i]
+			file.Seek(offset, 0)
+			reader.Reset(file)
+
+			line, err := reader.ReadString('\n')
+			if err != nil && err != io.EOF {
+				lines = append(lines, "")
+				continue
+			}
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			lines = append(lines, line)
+		}
+		lb.mu.Lock()
+		lb.pages[pageNum] = lines
+		lb.mu.Unlock()
+		return
+	}
+
+	// For original files, seek once and read sequentially (much faster)
+	startOffset := lb.index.offsets[startLine]
+	file.Seek(startOffset, 0)
+
+	lines := make([]string, 0, endLine-startLine)
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineCount := 0
+	for scanner.Scan() && lineCount < (endLine-startLine) {
+		lines = append(lines, scanner.Text())
+		lineCount++
+	}
+
+	lb.mu.Lock()
+	lb.pages[pageNum] = lines
+	lb.mu.Unlock()
+}
+
+// ensurePagesAround loads exactly 3 pages around the given line: prev, current, next
+// Preserves pages that are already loaded and still needed
+// For filtered views, uses result windowing instead
+func (lb *LineBuffer) ensurePagesAround(lineNum int) {
+	// For filtered views, use result windowing
+	if lb.index.isFiltered {
+		lb.ensureResultWindow(lineNum)
+		return
+	}
+
+	currentPage := lineNum / pageSize
+	lb.centerPage = currentPage
+
+	totalPages := (lb.index.totalLines + pageSize - 1) / pageSize
+	if totalPages == 0 {
+		return
+	}
+
+	// Calculate the 3-page window: prev, current, next
+	// Clamp to valid range [0, totalPages-1]
+	neededPages := make(map[int]bool)
+	for _, p := range []int{currentPage - 1, currentPage, currentPage + 1} {
+		if p >= 0 && p < totalPages {
+			neededPages[p] = true
+		}
+	}
+
+	// Load missing pages (synchronously to ensure they're available)
+	for p := range neededPages {
+		lb.mu.RLock()
+		_, exists := lb.pages[p]
+		lb.mu.RUnlock()
+		if !exists {
+			lb.loadPageSync(p)
+		}
+	}
+
+	// Evict pages not in the needed set
+	lb.mu.Lock()
+	for p := range lb.pages {
+		if !neededPages[p] {
+			delete(lb.pages, p)
+		}
+	}
+	lb.mu.Unlock()
+}
+
+// ensureResultWindow maintains a ~1000-line window around the current position
+// for filtered views. Loads more lines from the needed direction and evicts from the opposite.
+func (lb *LineBuffer) ensureResultWindow(lineNum int) {
+	totalLines := lb.index.totalLines
+	if totalLines == 0 {
+		return
+	}
+
+	halfWindow := lb.resultWindowTarget / 2
+	if halfWindow < 200 {
+		halfWindow = 200
+	}
+
+	// Calculate desired window bounds
+	desiredStart := lineNum - halfWindow
+	desiredEnd := lineNum + halfWindow
+	if desiredStart < 0 {
+		desiredStart = 0
+		desiredEnd = lb.resultWindowTarget
+	}
+	if desiredEnd > totalLines {
+		desiredEnd = totalLines
+		desiredStart = totalLines - lb.resultWindowTarget
+		if desiredStart < 0 {
+			desiredStart = 0
+		}
+	}
+
+	lb.mu.Lock()
+	currentStart := lb.resultWindow.startIdx
+	currentEnd := lb.resultWindow.endIdx
+	lb.mu.Unlock()
+
+	// Check if we need to reload (current position is near edges or outside window)
+	edgeThreshold := 200
+	needsReload := false
+
+	if lineNum < currentStart || lineNum >= currentEnd {
+		// Current line is outside window
+		needsReload = true
+	} else if lineNum-currentStart < edgeThreshold && currentStart > 0 {
+		// Near start edge and can load more from beginning
+		needsReload = true
+	} else if currentEnd-lineNum < edgeThreshold && currentEnd < totalLines {
+		// Near end edge and can load more from end
+		needsReload = true
+	}
+
+	if !needsReload {
+		return
+	}
+
+	// Load the new window
+	lb.loadResultWindow(desiredStart, desiredEnd)
+}
+
+// loadResultWindow loads result lines from disk for the given range
+func (lb *LineBuffer) loadResultWindow(startIdx, endIdx int) {
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx > lb.index.totalLines {
+		endIdx = lb.index.totalLines
+	}
+	if startIdx >= endIdx {
+		return
+	}
+
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	lines := make([]string, 0, endIdx-startIdx)
+	reader := bufio.NewReader(file)
+
+	for i := startIdx; i < endIdx; i++ {
+		offset := lb.index.offsets[i]
+		file.Seek(offset, 0)
+		reader.Reset(file)
+
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			lines = append(lines, "")
+			continue
+		}
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		lines = append(lines, line)
+	}
+
+	lb.mu.Lock()
+	lb.resultWindow.startIdx = startIdx
+	lb.resultWindow.endIdx = endIdx
+	lb.resultWindow.lines = lines
+	lb.mu.Unlock()
+}
+
+// GetLine returns a line, loading it if necessary
+func (lb *LineBuffer) GetLine(lineNum int) string {
+	if lineNum < 0 || lineNum >= lb.index.totalLines {
+		return ""
+	}
+
+	// For filtered views, use result window
+	if lb.index.isFiltered {
+		lb.mu.RLock()
+		if lineNum >= lb.resultWindow.startIdx && lineNum < lb.resultWindow.endIdx {
+			idx := lineNum - lb.resultWindow.startIdx
+			if idx < len(lb.resultWindow.lines) {
+				result := lb.resultWindow.lines[idx]
+				lb.mu.RUnlock()
+				return result
+			}
+		}
+		lb.mu.RUnlock()
+
+		// Line not in window - load window around this line
+		lb.ensureResultWindow(lineNum)
+
+		lb.mu.RLock()
+		defer lb.mu.RUnlock()
+		if lineNum >= lb.resultWindow.startIdx && lineNum < lb.resultWindow.endIdx {
+			idx := lineNum - lb.resultWindow.startIdx
+			if idx < len(lb.resultWindow.lines) {
+				return lb.resultWindow.lines[idx]
+			}
+		}
+		return ""
+	}
+
+	// For original files, use page-based loading
+	pageNum := lineNum / pageSize
+	lineInPage := lineNum % pageSize
+
+	lb.mu.RLock()
+	page, exists := lb.pages[pageNum]
+	if exists && lineInPage < len(page) {
+		result := page[lineInPage]
+		lb.mu.RUnlock()
+		return result
+	}
+	lb.mu.RUnlock()
+
+	// Page not loaded - load it synchronously (blocking)
+	lb.loadPageSync(pageNum)
+
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	page, exists = lb.pages[pageNum]
+	if exists && lineInPage < len(page) {
+		return page[lineInPage]
+	}
+	return ""
+}
+
+// GetHasANSI returns whether a line has ANSI codes (from index, no load needed)
+func (lb *LineBuffer) GetHasANSI(lineNum int) bool {
+	if lineNum < 0 || lineNum >= lb.index.totalLines {
+		return false
+	}
+	return lb.index.hasANSI[lineNum]
+}
+
+// SearchFromDisk searches the file from disk and returns matching line indices
+// Uses index offsets to correctly search filtered views (non-contiguous lines)
+// Parallelized with multiple workers for performance on filtered views
+// Uses sequential reading for original files (contiguous offsets)
+func (lb *LineBuffer) SearchFromDisk(query string, isRegex, ignoreCase bool) []int {
+	totalLines := lb.index.totalLines
+	if totalLines == 0 {
+		return nil
+	}
+
+	// Prepare regex/query once
+	var re *regexp.Regexp
+	var lowerQuery string
+	var err error
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	matchLine := func(line string, lineNum int) bool {
+		plainLine := line
+		if lineNum < len(lb.index.hasANSI) && lb.index.hasANSI[lineNum] {
+			plainLine = stripANSI(line)
+		}
+		if isRegex {
+			return re.MatchString(plainLine)
+		} else if ignoreCase {
+			return strings.Contains(strings.ToLower(plainLine), lowerQuery)
+		}
+		return strings.Contains(plainLine, query)
+	}
+
+	// Use sequential read for original files, seek-based for filtered views
+	if !lb.index.isFiltered {
+		// Sequential read - much faster for original files
+		return lb.searchSequential(matchLine)
+	}
+
+	// Seek-based read for filtered views (non-contiguous offsets)
+	return lb.searchWithSeeks(matchLine)
+}
+
+// searchSequential reads file sequentially (fast for original files)
+func (lb *LineBuffer) searchSequential(matchLine func(string, int) bool) []int {
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var matches []int
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if matchLine(line, lineNum) {
+			matches = append(matches, lineNum)
+		}
+		lineNum++
+	}
+
+	return matches
+}
+
+// searchWithSeeks uses seeks for each line (for filtered views with non-contiguous offsets)
+func (lb *LineBuffer) searchWithSeeks(matchLine func(string, int) bool) []int {
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var matches []int
+	reader := bufio.NewReader(file)
+
+	for lineNum := 0; lineNum < lb.index.totalLines; lineNum++ {
+		offset := lb.index.offsets[lineNum]
+		file.Seek(offset, 0)
+		reader.Reset(file)
+
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			continue
+		}
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if matchLine(line, lineNum) {
+			matches = append(matches, lineNum)
+		}
+	}
+
+	return matches
+}
+
+// FilterFromDisk filters the file from disk
+// Returns matching line indices and immediately reports the first match at/below startLine
+// via the firstMatch channel, then continues scanning
+// Uses sequential reading for original files, seek-based for filtered views
+func (lb *LineBuffer) FilterFromDisk(query string, isRegex, ignoreCase, keep bool, startLine int, firstMatch chan<- int) []int {
+	totalLines := lb.index.totalLines
+	if totalLines == 0 {
+		close(firstMatch)
+		return nil
+	}
+
+	// Prepare regex/query once
+	var re *regexp.Regexp
+	var lowerQuery string
+	var err error
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	matchLine := func(line string, lineNum int) bool {
+		plainLine := line
+		if lineNum < len(lb.index.hasANSI) && lb.index.hasANSI[lineNum] {
+			plainLine = stripANSI(line)
+		}
+		if isRegex {
+			return re.MatchString(plainLine)
+		} else if ignoreCase {
+			return strings.Contains(strings.ToLower(plainLine), lowerQuery)
+		}
+		return strings.Contains(plainLine, query)
+	}
+
+	// Use sequential read for original files, seek-based for filtered views
+	var matches []int
+	if !lb.index.isFiltered {
+		matches = lb.filterSequential(matchLine, keep)
+	} else {
+		matches = lb.filterWithSeeks(matchLine, keep)
+	}
+
+	// Send first match notification
+	firstMatchSent := false
+	for _, m := range matches {
+		if !firstMatchSent && m >= startLine {
+			firstMatch <- m
+			firstMatchSent = true
+			break
+		}
+	}
+	if !firstMatchSent && len(matches) > 0 {
+		firstMatch <- matches[0]
+	}
+	close(firstMatch)
+
+	return matches
+}
+
+// filterSequential reads file sequentially (fast for original files)
+func (lb *LineBuffer) filterSequential(matchLine func(string, int) bool, keep bool) []int {
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var matches []int
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if matchLine(line, lineNum) == keep {
+			matches = append(matches, lineNum)
+		}
+		lineNum++
+	}
+
+	return matches
+}
+
+// filterWithSeeks uses seeks for each line (for filtered views)
+func (lb *LineBuffer) filterWithSeeks(matchLine func(string, int) bool, keep bool) []int {
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var matches []int
+	reader := bufio.NewReader(file)
+
+	for lineNum := 0; lineNum < lb.index.totalLines; lineNum++ {
+		offset := lb.index.offsets[lineNum]
+		file.Seek(offset, 0)
+		reader.Reset(file)
+
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			continue
+		}
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if matchLine(line, lineNum) == keep {
+			matches = append(matches, lineNum)
+		}
+	}
+
+	return matches
+}
+
+// CreateFilteredBuffer creates a new LineBuffer for a filtered view
+// It references the same file but only the lines at the given indices
+func (lb *LineBuffer) CreateFilteredBuffer(matchedIndices []int) (*LineBuffer, error) {
+	if len(matchedIndices) == 0 {
+		return nil, fmt.Errorf("no matches")
+	}
+
+	// Create new index for filtered view
+	filteredIndex := &LineIndex{
+		filename:   lb.index.filename,
+		totalLines: len(matchedIndices),
+		offsets:    make([]int64, len(matchedIndices)),
+		hasANSI:    make([]bool, len(matchedIndices)),
+		isFiltered: true, // Mark as filtered so search/filter use seek-based reading
+	}
+
+	for i, origIdx := range matchedIndices {
+		if origIdx < len(lb.index.offsets) {
+			filteredIndex.offsets[i] = lb.index.offsets[origIdx]
+		}
+		if origIdx < len(lb.index.hasANSI) {
+			filteredIndex.hasANSI[i] = lb.index.hasANSI[origIdx]
+		}
+	}
+
+	return NewLineBuffer(filteredIndex)
 }
 
 // App holds the application state
@@ -530,9 +1199,14 @@ type SearchState struct {
 	regex      *regexp.Regexp // Compiled regex pattern
 	isRegex    bool           // True if regex mode is enabled
 	ignoreCase bool           // True if case-insensitive search
-	matches    []int          // Line indices that match
+	matches    []int          // Line indices that match (flattened from pageMatches)
 	current    int            // Current match index (-1 if none)
 	backward   bool           // True if last search was backward (?)
+
+	// Incremental search cache for paged viewers
+	searchedPages map[int]bool   // Pages we've already searched
+	pageMatches   map[int][]int  // pageNum -> matching line indices within that page
+	totalPages    int            // Total number of pages in the file
 }
 
 // Clear resets the search state
@@ -544,11 +1218,40 @@ func (s *SearchState) Clear() {
 	s.matches = nil
 	s.current = -1
 	s.backward = false
+	s.searchedPages = nil
+	s.pageMatches = nil
+	s.totalPages = 0
+}
+
+// SetMatches sets search results directly (for paged search)
+func (s *SearchState) SetMatches(query string, matches []int, isRegex, ignoreCase, backward bool) {
+	s.query = query
+	s.isRegex = isRegex
+	s.ignoreCase = ignoreCase
+	s.matches = matches
+	s.current = 0
+	s.backward = backward
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		s.regex, _ = regexp.Compile(pattern)
+	}
 }
 
 // HasResults returns true if there are search results
 func (s *SearchState) HasResults() bool {
 	return len(s.matches) > 0
+}
+
+// ResetPosition clears cached matches so next search starts fresh from new position
+// Called after navigation jumps (g, G, pgup, pgdown) to ensure n/N searches from new location
+func (s *SearchState) ResetPosition() {
+	s.matches = nil
+	s.current = -1
+	// Keep query, regex, isRegex, ignoreCase, backward so user can search again with n/N
 }
 
 // AtEnd returns true if at the last match
@@ -724,6 +1427,20 @@ func NewViewer(filename string) (*Viewer, error) {
 		return nil, err
 	}
 
+	// Check file size to decide if we should use paging
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// For large files (> 250MB), use paging mode
+	if stat.Size() > pagingThresholdBytes {
+		file.Close()
+		return newPagedViewer(filename)
+	}
+
+	// Standard in-memory mode for smaller files
 	v := &Viewer{
 		lines:    nil,
 		loading:  true,
@@ -742,6 +1459,32 @@ func NewViewer(filename string) (*Viewer, error) {
 			go v.followFile(filename)
 		}
 	}()
+
+	return v, nil
+}
+
+// newPagedViewer creates a viewer using paging for large files
+func newPagedViewer(filename string) (*Viewer, error) {
+	// Build line index (first pass - stores only offsets)
+	index, err := buildLineIndex(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create line buffer
+	buffer, err := NewLineBuffer(index)
+	if err != nil {
+		return nil, err
+	}
+
+	v := &Viewer{
+		paged:      true,
+		lineBuffer: buffer,
+		filename:   filename,
+		loading:    false,
+		topLine:    0,
+		leftCol:    0,
+	}
 
 	return v, nil
 }
@@ -884,6 +1627,12 @@ func NewViewerFromLines(lines []string) *Viewer {
 
 // LineCount returns the number of lines (thread-safe)
 func (v *Viewer) LineCount() int {
+	if v.paged {
+		if v.lineBuffer == nil {
+			return 0 // Still loading
+		}
+		return v.lineBuffer.index.totalLines
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return len(v.lines)
@@ -891,6 +1640,12 @@ func (v *Viewer) LineCount() int {
 
 // GetLine returns a line at index (thread-safe), or empty string if out of bounds
 func (v *Viewer) GetLine(idx int) string {
+	if v.paged {
+		if v.lineBuffer == nil {
+			return "" // Still loading
+		}
+		return v.lineBuffer.GetLine(idx)
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	if idx < 0 || idx >= len(v.lines) {
@@ -900,7 +1655,20 @@ func (v *Viewer) GetLine(idx int) string {
 }
 
 // GetLines returns a copy of lines slice (thread-safe)
+// For paged viewers, this scans the file - use sparingly!
 func (v *Viewer) GetLines() []string {
+	if v.paged {
+		if v.lineBuffer == nil {
+			return nil // Still loading
+		}
+		// For paged mode, load all lines from disk (expensive!)
+		count := v.lineBuffer.index.totalLines
+		result := make([]string, count)
+		for i := 0; i < count; i++ {
+			result[i] = v.lineBuffer.GetLine(i)
+		}
+		return result
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	result := make([]string, len(v.lines))
@@ -910,11 +1678,24 @@ func (v *Viewer) GetLines() []string {
 
 // GetHasANSI returns a copy of hasANSI slice (thread-safe)
 func (v *Viewer) GetHasANSI() []bool {
+	if v.paged {
+		if v.lineBuffer == nil {
+			return nil // Still loading
+		}
+		return v.lineBuffer.index.hasANSI
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	result := make([]bool, len(v.hasANSI))
 	copy(result, v.hasANSI)
 	return result
+}
+
+// Close cleans up resources (for paged viewers)
+func (v *Viewer) Close() {
+	if v.paged && v.lineBuffer != nil {
+		v.lineBuffer.Close()
+	}
 }
 
 // IsLoading returns true if still loading (thread-safe)
@@ -1168,6 +1949,11 @@ func (v *Viewer) navigateUp() {
 			v.topLine--
 		}
 	}
+
+	// For paged mode: update buffer around new position
+	if v.paged && v.lineBuffer != nil {
+		v.lineBuffer.ensurePagesAround(v.topLine)
+	}
 }
 
 func (v *Viewer) navigateDown() {
@@ -1188,6 +1974,11 @@ func (v *Viewer) navigateDown() {
 		if v.topLine < maxTop {
 			v.topLine++
 		}
+	}
+
+	// For paged mode: update buffer around new position
+	if v.paged && v.lineBuffer != nil {
+		v.lineBuffer.ensurePagesAround(v.topLine)
 	}
 }
 
@@ -1229,6 +2020,11 @@ func (v *Viewer) pageDown() {
 			v.topLine = maxTop
 		}
 	}
+
+	// For paged mode: update buffer around new position
+	if v.paged {
+		v.lineBuffer.ensurePagesAround(v.topLine)
+	}
 }
 
 func (v *Viewer) pageUp() {
@@ -1243,11 +2039,21 @@ func (v *Viewer) pageUp() {
 			v.topLine = 0
 		}
 	}
+
+	// For paged mode: update buffer around new position
+	if v.paged {
+		v.lineBuffer.ensurePagesAround(v.topLine)
+	}
 }
 
 func (v *Viewer) goToStart() {
 	v.topLine = 0
 	v.topLineOffset = 0
+
+	// For paged mode: update buffer around new position
+	if v.paged {
+		v.lineBuffer.ensurePagesAround(v.topLine)
+	}
 }
 
 func (v *Viewer) goToEnd() {
@@ -1256,6 +2062,11 @@ func (v *Viewer) goToEnd() {
 	v.topLine = v.LineCount() - 1
 	if v.topLine < 0 {
 		v.topLine = 0
+	}
+
+	// For paged mode: update buffer around new position
+	if v.paged {
+		v.lineBuffer.ensurePagesAround(v.topLine)
 	}
 }
 
@@ -1415,6 +2226,11 @@ func (s *ViewerStack) Pop() bool {
 	if len(s.viewers) <= 1 {
 		return false
 	}
+	// Close paged viewer to release resources
+	popped := s.viewers[len(s.viewers)-1]
+	if popped.paged && popped.lineBuffer != nil {
+		popped.lineBuffer.Close()
+	}
 	s.viewers = s.viewers[:len(s.viewers)-1]
 	return true
 }
@@ -1423,6 +2239,12 @@ func (s *ViewerStack) Pop() bool {
 func (s *ViewerStack) Reset() bool {
 	if len(s.viewers) <= 1 {
 		return false
+	}
+	// Close all paged viewers being removed
+	for i := 1; i < len(s.viewers); i++ {
+		if s.viewers[i].paged && s.viewers[i].lineBuffer != nil {
+			s.viewers[i].lineBuffer.Close()
+		}
 	}
 	s.viewers = s.viewers[:1]
 	return true
@@ -2173,6 +2995,12 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
+		// For paged viewers, use disk-based filtering
+		if current.paged {
+			a.handlePagedFilter(current, query, isRegex, ignoreCase, keep, currentTopLine)
+			return
+		}
+
 		lines := current.GetLines()       // Get snapshot for thread-safety
 		hasANSICache := current.GetHasANSI() // Get ANSI cache
 
@@ -2285,6 +3113,107 @@ func (a *App) HandleFilter(keep bool) {
 	}
 }
 
+// handlePagedFilter handles filtering for paged viewers
+// Shows first result immediately, continues scanning in background
+func (a *App) handlePagedFilter(current *Viewer, query string, isRegex, ignoreCase, keep bool, startLine int) {
+	// Create placeholder viewer with loading state
+	newViewer := &Viewer{
+		loading:  true,
+		filename: current.filename,
+		paged:    true,
+	}
+	a.stack.Push(newViewer)
+	a.search.Clear()
+
+	// Start filtering in background
+	go func() {
+		// Use a result channel to get matchedIndices when done
+		resultChan := make(chan []int, 1)
+		firstMatchChan := make(chan int, 1)
+
+		// Start the filter scan
+		go func() {
+			matches := current.lineBuffer.FilterFromDisk(query, isRegex, ignoreCase, keep, startLine, firstMatchChan)
+			resultChan <- matches
+		}()
+
+		// Wait for first match (shows progress)
+		firstMatch := -1
+		select {
+		case fm, ok := <-firstMatchChan:
+			if ok {
+				firstMatch = fm
+			}
+		}
+
+		// Drain remaining first match notifications
+		go func() {
+			for range firstMatchChan {
+			}
+		}()
+
+		// Wait for full scan to complete
+		matchedIndices := <-resultChan
+
+		if len(matchedIndices) == 0 {
+			a.stack.Pop()
+			a.ShowTempMessage("No matches found")
+			termbox.Interrupt()
+			return
+		}
+
+		// Create filtered buffer
+		filteredBuffer, err := current.lineBuffer.CreateFilteredBuffer(matchedIndices)
+		if err != nil {
+			a.stack.Pop()
+			a.ShowTempMessage("Filter failed: " + err.Error())
+			termbox.Interrupt()
+			return
+		}
+
+		// Find position in filtered view for first match
+		topLinePos := 0
+		for i, origIdx := range matchedIndices {
+			if origIdx >= startLine {
+				topLinePos = i
+				break
+			}
+		}
+		if topLinePos >= len(matchedIndices) {
+			topLinePos = 0
+		}
+
+		// Compute originIndices that map to the ORIGINAL file (not parent)
+		// matchedIndices are indices into current (parent) view
+		var originIndices []int
+		if current.originIndices != nil {
+			// Current is a filtered view - translate through its originIndices
+			originIndices = make([]int, len(matchedIndices))
+			for i, idx := range matchedIndices {
+				if idx < len(current.originIndices) {
+					originIndices[i] = current.originIndices[idx]
+				}
+			}
+		} else {
+			// Current is the original file
+			originIndices = matchedIndices
+		}
+
+		// Update the viewer with results
+		newViewer.lineBuffer = filteredBuffer
+		newViewer.originIndices = originIndices
+		newViewer.topLine = topLinePos
+		newViewer.loading = false
+
+		// Ensure pages are loaded around the view
+		filteredBuffer.ensurePagesAround(topLinePos)
+
+		termbox.Interrupt()
+
+		_ = firstMatch // Used for progress indication
+	}()
+}
+
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
@@ -2293,6 +3222,13 @@ func (a *App) HandleFilterAppend() {
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers("+")
 	if ok && query != "" {
 		original := a.stack.viewers[0]
+
+		// Handle paged viewers separately
+		if original.paged {
+			a.handlePagedFilterAppend(current, original, query, isRegex, ignoreCase)
+			return
+		}
+
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
 		originalHasANSI := original.GetHasANSI()
@@ -2426,6 +3362,105 @@ func (a *App) HandleFilterAppend() {
 	}
 }
 
+// handlePagedFilterAppend handles append filter for paged viewers
+func (a *App) handlePagedFilterAppend(current, original *Viewer, query string, isRegex, ignoreCase bool) {
+	currentTopLine := current.topLine
+
+	// Create placeholder viewer with loading state
+	newViewer := &Viewer{
+		loading:  true,
+		filename: current.filename,
+		paged:    true,
+	}
+	a.stack.Push(newViewer)
+	a.search.Clear()
+
+	go func() {
+		// Get current view's origin indices (lines in original file)
+		currentIndices := current.originIndices
+		if currentIndices == nil {
+			// If no originIndices (viewing original), treat all lines as included
+			currentIndices = make([]int, current.LineCount())
+			for i := range currentIndices {
+				currentIndices[i] = i
+			}
+		}
+
+		// Make a set of current indices for fast lookup
+		currentSet := make(map[int]bool)
+		for _, idx := range currentIndices {
+			currentSet[idx] = true
+		}
+
+		// Filter original file from disk for new matches
+		resultChan := make(chan []int, 1)
+		firstMatchChan := make(chan int, 1)
+
+		go func() {
+			matches := original.lineBuffer.FilterFromDisk(query, isRegex, ignoreCase, true, 0, firstMatchChan)
+			resultChan <- matches
+		}()
+
+		// Drain first match notifications
+		go func() {
+			for range firstMatchChan {
+			}
+		}()
+
+		// Wait for full scan
+		newMatches := <-resultChan
+
+		// Combine: current indices + new matches (union)
+		for _, idx := range newMatches {
+			if !currentSet[idx] {
+				currentIndices = append(currentIndices, idx)
+				currentSet[idx] = true
+			}
+		}
+
+		// Sort the combined indices
+		sort.Ints(currentIndices)
+
+		if len(currentIndices) == 0 {
+			a.stack.Pop()
+			a.ShowTempMessage("No matches found")
+			termbox.Interrupt()
+			return
+		}
+
+		// Create filtered buffer
+		filteredBuffer, err := original.lineBuffer.CreateFilteredBuffer(currentIndices)
+		if err != nil {
+			a.stack.Pop()
+			a.ShowTempMessage("Filter failed: " + err.Error())
+			termbox.Interrupt()
+			return
+		}
+
+		// Find position in new view for old topLine
+		topLinePos := 0
+		if currentTopLine < len(current.originIndices) {
+			origIdx := current.originIndices[currentTopLine]
+			for i, idx := range currentIndices {
+				if idx >= origIdx {
+					topLinePos = i
+					break
+				}
+			}
+		}
+
+		// Update viewer
+		newViewer.lineBuffer = filteredBuffer
+		newViewer.originIndices = currentIndices
+		newViewer.topLine = topLinePos
+		newViewer.loading = false
+
+		filteredBuffer.ensurePagesAround(topLinePos)
+
+		termbox.Interrupt()
+	}()
+}
+
 // HandleGotoLine prompts for a line number and jumps to it
 func (a *App) HandleGotoLine() {
 	current := a.stack.Current()
@@ -2446,6 +3481,14 @@ func (a *App) HandleGotoLine() {
 			lineIdx = maxLine
 		}
 		current.topLine = lineIdx
+
+		// Reset search position so next n/N starts from new location
+		a.search.ResetPosition()
+
+		// For paged mode: update buffer around new position
+		if current.paged && current.lineBuffer != nil {
+			current.lineBuffer.ensurePagesAround(lineIdx)
+		}
 	}
 }
 
@@ -2540,22 +3583,310 @@ func (a *App) HandleSearch(backward bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
-		lines := current.GetLines()
-		hasANSI := current.GetHasANSI()
-		lineIdx := a.search.Search(lines, hasANSI, query, current.topLine, backward, isRegex, ignoreCase)
+		var lineIdx int
+
+		if current.paged {
+			// Disk-based search for paged viewers
+			lineIdx = a.searchPaged(current, query, isRegex, ignoreCase, backward)
+		} else {
+			lines := current.GetLines()
+			hasANSI := current.GetHasANSI()
+			lineIdx = a.search.Search(lines, hasANSI, query, current.topLine, backward, isRegex, ignoreCase)
+		}
+
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
+			if current.paged {
+				current.lineBuffer.ensurePagesAround(lineIdx)
+			}
 		} else if a.search.HasResults() {
 			a.ShowTempMessage(noMatchMsg)
 		}
 	}
 }
 
+// searchPaged performs memory-efficient search for paged viewers
+// Searches loaded pages first, then scans file from disk without keeping pages in memory
+func (a *App) searchPaged(current *Viewer, query string, isRegex, ignoreCase, backward bool) int {
+	lb := current.lineBuffer
+	topLine := current.topLine
+
+	// Initialize search state
+	a.search.query = query
+	a.search.isRegex = isRegex
+	a.search.ignoreCase = ignoreCase
+	a.search.backward = backward
+	a.search.searchedPages = nil // Not used for disk search
+	a.search.pageMatches = nil   // Not used for disk search
+	a.search.totalPages = 0
+	a.search.matches = nil
+	a.search.current = -1
+
+	// Compile regex if needed
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		var err error
+		a.search.regex, err = regexp.Compile(pattern)
+		if err != nil {
+			a.search.regex = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else {
+		a.search.regex = nil
+	}
+
+	// First, search currently loaded pages (already in memory)
+	lb.mu.RLock()
+	loadedPages := make([]int, 0, len(lb.pages))
+	for p := range lb.pages {
+		loadedPages = append(loadedPages, p)
+	}
+	lb.mu.RUnlock()
+
+	sort.Ints(loadedPages)
+
+	var allMatches []int
+	for _, p := range loadedPages {
+		matches := a.searchPageInMemory(lb, p)
+		allMatches = append(allMatches, matches...)
+	}
+
+	// Check if we found a match in loaded pages
+	result := a.findMatchInSlice(allMatches, topLine, backward)
+	if result >= 0 {
+		a.search.matches = allMatches
+		a.search.current = 0
+		return result
+	}
+
+	// No match in loaded pages - scan file from disk (without loading into memory)
+	a.ShowTempMessage("Searching...")
+	termbox.Flush()
+
+	result = a.searchFromDiskStreaming(lb, topLine, backward)
+	if result >= 0 {
+		// Found a match - load the 3-page window around it
+		lb.ensurePagesAround(result)
+		return result
+	}
+
+	a.search.Clear()
+	a.ShowTempMessage("Pattern not found")
+	return -1
+}
+
+// searchFromDiskStreaming scans file from disk page by page without keeping all pages in memory
+// Returns the first match found in the search direction, or -1 if none
+// Only keeps matches from the page containing the found result (memory efficient)
+// Does NOT wrap - returns -1 and shows EOF/BOF message when reaching end
+func (a *App) searchFromDiskStreaming(lb *LineBuffer, startLine int, backward bool) int {
+	totalLines := lb.index.totalLines
+	if totalLines == 0 {
+		return -1
+	}
+
+	totalPages := (totalLines + pageSize - 1) / pageSize
+	startPage := startLine / pageSize
+
+	// Open file for page-by-page search
+	file, err := os.Open(lb.index.filename)
+	if err != nil {
+		return -1
+	}
+	defer file.Close()
+
+	if backward {
+		// Search backward: start from current page, go to page 0
+		for p := startPage; p >= 0; p-- {
+			pageMatches := a.searchPageFromDisk(file, lb, p)
+			if len(pageMatches) > 0 {
+				// Find the last match before startLine in this page
+				for i := len(pageMatches) - 1; i >= 0; i-- {
+					if pageMatches[i] < startLine {
+						// Found a match - only keep this page's matches
+						a.search.matches = pageMatches
+						return pageMatches[i]
+					}
+				}
+				// All matches in this page are at or after startLine, keep searching
+			}
+		}
+
+		// No match found before current position
+		a.ShowTempMessage("BOF")
+		return -1
+	}
+
+	// Search forward: start from current page, go to last page
+	for p := startPage; p < totalPages; p++ {
+		pageMatches := a.searchPageFromDisk(file, lb, p)
+		if len(pageMatches) > 0 {
+			// Find first match at or after startLine in this page
+			for _, m := range pageMatches {
+				if m >= startLine {
+					// Found a match - only keep this page's matches
+					a.search.matches = pageMatches
+					return m
+				}
+			}
+			// All matches in this page are before startLine, keep searching
+		}
+	}
+
+	// No match found after current position
+	a.ShowTempMessage("EOF")
+	return -1
+}
+
+// searchPageFromDisk reads a page from disk and returns all matching line indices
+// Does NOT store the page in memory - temporary read only
+func (a *App) searchPageFromDisk(file *os.File, lb *LineBuffer, pageNum int) []int {
+	startLine := pageNum * pageSize
+	endLine := startLine + pageSize
+	if endLine > lb.index.totalLines {
+		endLine = lb.index.totalLines
+	}
+	if startLine >= lb.index.totalLines {
+		return nil
+	}
+
+	// Check if this page is already in memory - use it if so
+	lb.mu.RLock()
+	if page, exists := lb.pages[pageNum]; exists {
+		lb.mu.RUnlock()
+		var matches []int
+		for i, line := range page {
+			lineNum := startLine + i
+			if a.matchLine(line, lineNum, lb) {
+				matches = append(matches, lineNum)
+			}
+		}
+		return matches
+	}
+	lb.mu.RUnlock()
+
+	// Read page from disk using byte offsets
+	var matches []int
+
+	if lb.index.isFiltered {
+		// Filtered file: seek for each line
+		reader := bufio.NewReader(file)
+		for lineNum := startLine; lineNum < endLine; lineNum++ {
+			line := a.readLineFromDisk(file, reader, lb, lineNum)
+			if a.matchLine(line, lineNum, lb) {
+				matches = append(matches, lineNum)
+			}
+		}
+	} else {
+		// Original file: seek to page start, read sequentially
+		if startLine < len(lb.index.offsets) {
+			startOffset := lb.index.offsets[startLine]
+			file.Seek(startOffset, 0)
+
+			scanner := bufio.NewScanner(file)
+			buf := make([]byte, 0, 64*1024)
+			scanner.Buffer(buf, 1024*1024)
+
+			lineNum := startLine
+			for scanner.Scan() && lineNum < endLine {
+				if a.matchLine(scanner.Text(), lineNum, lb) {
+					matches = append(matches, lineNum)
+				}
+				lineNum++
+			}
+		}
+	}
+
+	return matches
+}
+
+// readLineFromDisk reads a single line from disk using the line index
+func (a *App) readLineFromDisk(file *os.File, reader *bufio.Reader, lb *LineBuffer, lineNum int) string {
+	if lineNum < 0 || lineNum >= len(lb.index.offsets) {
+		return ""
+	}
+	offset := lb.index.offsets[lineNum]
+	file.Seek(offset, 0)
+	reader.Reset(file)
+
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return ""
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	return line
+}
+
+// matchLine checks if a line matches the current search pattern
+func (a *App) matchLine(line string, lineNum int, lb *LineBuffer) bool {
+	plainLine := line
+	if lineNum < len(lb.index.hasANSI) && lb.index.hasANSI[lineNum] {
+		plainLine = stripANSI(line)
+	}
+
+	if a.search.regex != nil {
+		return a.search.regex.MatchString(plainLine)
+	} else if a.search.ignoreCase {
+		return strings.Contains(strings.ToLower(plainLine), strings.ToLower(a.search.query))
+	}
+	return strings.Contains(plainLine, a.search.query)
+}
+
+// searchPageInMemory searches a page that's already loaded in memory
+func (a *App) searchPageInMemory(lb *LineBuffer, pageNum int) []int {
+	lb.mu.RLock()
+	page, exists := lb.pages[pageNum]
+	lb.mu.RUnlock()
+
+	if !exists {
+		return nil
+	}
+
+	var matches []int
+	startLine := pageNum * pageSize
+
+	for i, line := range page {
+		lineNum := startLine + i
+		if a.matchLine(line, lineNum, lb) {
+			matches = append(matches, lineNum)
+		}
+	}
+
+	return matches
+}
+
+// findMatchInSlice finds the first match in the given direction
+func (a *App) findMatchInSlice(matches []int, topLine int, backward bool) int {
+	if len(matches) == 0 {
+		return -1
+	}
+
+	if backward {
+		for i := len(matches) - 1; i >= 0; i-- {
+			if matches[i] <= topLine {
+				return matches[i]
+			}
+		}
+	} else {
+		for _, m := range matches {
+			if m >= topLine {
+				return m
+			}
+		}
+	}
+
+	return -1
+}
+
 // HandleSearchNav navigates search results
 // If reverse is false (n key): continues in search direction
 // If reverse is true (N key): goes opposite to search direction
 func (a *App) HandleSearchNav(reverse bool) {
-	if !a.search.HasResults() {
+	// If no query, nothing to do
+	if a.search.query == "" {
 		return
 	}
 
@@ -2564,6 +3895,30 @@ func (a *App) HandleSearchNav(reverse bool) {
 
 	// Determine if we should go forward (down) or backward (up) in the file
 	goingUp := a.search.backward != reverse
+
+	// If no cached results (after navigation reset), search from current position
+	if !a.search.HasResults() {
+		if current.paged && current.lineBuffer != nil {
+			newMatch := a.searchNextFromDisk(current, topLine, goingUp)
+			if newMatch >= 0 {
+				current.topLine = newMatch
+				current.lineBuffer.ensurePagesAround(newMatch)
+			} else {
+				a.ShowTempMessage("Pattern not found")
+			}
+		} else {
+			// For non-paged viewers, re-do the search
+			lines := current.GetLines()
+			hasANSI := current.GetHasANSI()
+			lineIdx := a.search.Search(lines, hasANSI, a.search.query, topLine, goingUp, a.search.isRegex, a.search.ignoreCase)
+			if lineIdx >= 0 {
+				current.topLine = lineIdx
+			} else {
+				a.ShowTempMessage("Pattern not found")
+			}
+		}
+		return
+	}
 
 	if goingUp {
 		// Find the last match BEFORE topLine
@@ -2577,7 +3932,18 @@ func (a *App) HandleSearchNav(reverse bool) {
 			}
 		}
 		if !found {
+			// For paged viewers, search backward from disk
+			if current.paged && current.lineBuffer != nil {
+				newMatch := a.searchNextFromDisk(current, topLine, true)
+				if newMatch >= 0 {
+					current.topLine = newMatch
+					current.lineBuffer.ensurePagesAround(newMatch)
+					return
+				}
+			}
 			a.ShowTempMessage("BOF")
+		} else if current.paged && current.lineBuffer != nil {
+			current.lineBuffer.ensurePagesAround(current.topLine)
 		}
 	} else {
 		// Find the first match AFTER topLine
@@ -2591,9 +3957,48 @@ func (a *App) HandleSearchNav(reverse bool) {
 			}
 		}
 		if !found {
+			// For paged viewers, search forward from disk
+			if current.paged && current.lineBuffer != nil {
+				newMatch := a.searchNextFromDisk(current, topLine, false)
+				if newMatch >= 0 {
+					current.topLine = newMatch
+					current.lineBuffer.ensurePagesAround(newMatch)
+					return
+				}
+			}
 			a.ShowTempMessage("EOF")
+		} else if current.paged && current.lineBuffer != nil {
+			current.lineBuffer.ensurePagesAround(current.topLine)
 		}
 	}
+}
+
+// searchNextFromDisk searches for next match from disk without loading pages into memory
+// Returns the line index of the next match, or -1 if none found
+func (a *App) searchNextFromDisk(current *Viewer, startLine int, backward bool) int {
+	lb := current.lineBuffer
+	if a.search.query == "" {
+		return -1
+	}
+
+	// Adjust start position based on direction (no wrap)
+	searchFrom := startLine
+	if backward {
+		searchFrom = startLine - 1
+		if searchFrom < 0 {
+			a.ShowTempMessage("BOF")
+			return -1
+		}
+	} else {
+		searchFrom = startLine + 1
+		if searchFrom >= lb.index.totalLines {
+			a.ShowTempMessage("EOF")
+			return -1
+		}
+	}
+
+	// searchFromDiskStreaming already sets a.search.matches with the page's matches
+	return a.searchFromDiskStreaming(lb, searchFrom, backward)
 }
 
 // HandleStackNav navigates the viewer stack
@@ -3170,12 +4575,14 @@ func (v *Viewer) run() error {
 						app.VisualGoToStart()
 					} else {
 						current.goToStart()
+						app.search.ResetPosition()
 					}
 				case 'G':
 					if app.visualMode {
 						app.VisualGoToEnd()
 					} else {
 						current.goToEnd()
+						app.search.ResetPosition()
 					}
 				case ':':
 					app.HandleGotoLine()
@@ -3248,24 +4655,28 @@ func (v *Viewer) run() error {
 						app.VisualPageDown()
 					} else {
 						current.pageDown()
+						app.search.ResetPosition()
 					}
 				case termbox.KeyPgup, termbox.KeyCtrlU:
 					if app.visualMode {
 						app.VisualPageUp()
 					} else {
 						current.pageUp()
+						app.search.ResetPosition()
 					}
 				case termbox.KeyHome:
 					if app.visualMode {
 						app.VisualGoToStart()
 					} else {
 						current.goToStart()
+						app.search.ResetPosition()
 					}
 				case termbox.KeyEnd:
 					if app.visualMode {
 						app.VisualGoToEnd()
 					} else {
 						current.goToEnd()
+						app.search.ResetPosition()
 					}
 				case termbox.KeyF1:
 					app.ShowHelp()
