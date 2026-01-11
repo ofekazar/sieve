@@ -201,8 +201,8 @@ func findJSONEnd(line string, jsonStart int) int {
 	return -1
 }
 
-// stripANSIForJSON removes ANSI escape codes from a string for JSON parsing
-func stripANSIForJSON(s string) string {
+// stripANSI removes ANSI escape codes from a string
+func stripANSI(s string) string {
 	var result strings.Builder
 	i := 0
 	for i < len(s) {
@@ -222,6 +222,11 @@ func stripANSIForJSON(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// stripANSIForJSON removes ANSI escape codes from a string for JSON parsing
+func stripANSIForJSON(s string) string {
+	return stripANSI(s)
 }
 
 // pythonToJSON converts Python dict syntax to JSON
@@ -580,7 +585,8 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 	// Fast path: literal case-sensitive search using strings.Contains
 	if !isRegex && !ignoreCase {
 		for i, line := range lines {
-			if strings.Contains(line, query) {
+			plainLine := stripANSI(line)
+			if strings.Contains(plainLine, query) {
 				s.matches = append(s.matches, i)
 			}
 		}
@@ -588,7 +594,8 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 		// Case-insensitive literal search
 		lowerQuery := strings.ToLower(query)
 		for i, line := range lines {
-			if strings.Contains(strings.ToLower(line), lowerQuery) {
+			plainLine := stripANSI(line)
+			if strings.Contains(strings.ToLower(plainLine), lowerQuery) {
 				s.matches = append(s.matches, i)
 			}
 		}
@@ -606,7 +613,8 @@ func (s *SearchState) Search(lines []string, query string, startLine int, backwa
 		s.regex = re
 
 		for i, line := range lines {
-			if s.regex.MatchString(line) {
+			plainLine := stripANSI(line)
+			if s.regex.MatchString(plainLine) {
 				s.matches = append(s.matches, i)
 			}
 		}
@@ -1947,15 +1955,17 @@ func (a *App) HandleFilter(keep bool) {
 				a.ShowTempMessage("Invalid regex: " + err.Error())
 				return
 			}
-			matcher = re.MatchString
+			matcher = func(line string) bool {
+				return re.MatchString(stripANSI(line))
+			}
 		} else if ignoreCase {
 			queryLower := strings.ToLower(query)
 			matcher = func(line string) bool {
-				return strings.Contains(strings.ToLower(line), queryLower)
+				return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
 			}
 		} else {
 			matcher = func(line string) bool {
-				return strings.Contains(line, query)
+				return strings.Contains(stripANSI(line), query)
 			}
 		}
 
@@ -2090,15 +2100,17 @@ func (a *App) HandleFilterAppend() {
 				a.ShowTempMessage("Invalid regex: " + err.Error())
 				return
 			}
-			matcher = re.MatchString
+			matcher = func(line string) bool {
+				return re.MatchString(stripANSI(line))
+			}
 		} else if ignoreCase {
 			queryLower := strings.ToLower(query)
 			matcher = func(line string) bool {
-				return strings.Contains(strings.ToLower(line), queryLower)
+				return strings.Contains(strings.ToLower(stripANSI(line)), queryLower)
 			}
 		} else {
 			matcher = func(line string) bool {
-				return strings.Contains(line, query)
+				return strings.Contains(stripANSI(line), query)
 			}
 		}
 
