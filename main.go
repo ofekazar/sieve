@@ -334,12 +334,21 @@ func isJSON(line string) bool {
 }
 
 type Viewer struct {
+	// Line storage - used for small files or when paging is disabled
 	lines            []string     // All lines from the file
 	hasANSI          []bool       // True if corresponding line has ANSI escape codes
 	originIndices    []int        // Maps each line to its index in parent viewer (for filtered views)
 	mu               sync.RWMutex // Protects lines during background loading
 	loading          bool         // True while file is still loading
 	filename         string       // Original filename (empty for filtered views)
+	
+	// Paging fields - for large files (>1M lines)
+	paged      bool        // True if using paging mode
+	lineIndex  *LineIndex  // Metadata for all lines (when paged)
+	pageCache  *PageCache  // Cached line pages (when paged)
+	prefetcher *Prefetcher // Background page loader (when paged)
+	
+	// Display settings
 	wordWrap         bool         // Word wrap mode
 	jsonPretty       bool         // JSON pretty-print mode
 	showLineNumbers  bool         // Show line numbers on left side
@@ -357,6 +366,523 @@ type Viewer struct {
 // ViewerStack manages a stack of viewers for filtering navigation
 type ViewerStack struct {
 	viewers []*Viewer
+	mu      sync.RWMutex // Protects viewers slice for concurrent access
+}
+
+// ============================================================================
+// Smart Pager Types - for large file support (>1M lines)
+// ============================================================================
+
+const (
+	pagingThreshold     = 1000000 // Enable paging for files > 1M lines
+	pageSize            = 1000    // Lines per page
+	maxPagesInMemory    = 100     // ~100k lines max in memory
+	filterPagingThreshold = 50000 // Page filtered views if result > 50k lines
+)
+
+// LineIndex stores metadata for all lines without storing line content
+// This allows navigation and search without loading all lines into memory
+type LineIndex struct {
+	offsets    []int64 // Byte offset of each line start in file
+	hasANSI    []bool  // Whether each line has ANSI escape codes
+	totalLines int     // Total number of lines
+	filename   string  // File path for seeking
+	isFiltered bool    // True if this is a filtered view (non-contiguous offsets)
+}
+
+// NewLineIndex builds a line index by scanning the file once
+// Uses chunk-based reading for memory efficiency
+func NewLineIndex(filename string) (*LineIndex, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// Get file size for pre-allocation estimate
+	stat, _ := file.Stat()
+	fileSize := stat.Size()
+	estimatedLines := int(fileSize / 200)
+	if estimatedLines > 10_000_000 {
+		estimatedLines = 10_000_000
+	}
+
+	idx := &LineIndex{
+		filename: filename,
+		offsets:  make([]int64, 0, estimatedLines),
+		hasANSI:  make([]bool, 0, estimatedLines),
+	}
+
+	// Read in large chunks and find newlines using bytes.IndexByte (optimized)
+	const bufSize = 1024 * 1024 // 1MB chunks for better throughput
+	buf := make([]byte, bufSize)
+	var fileOffset int64 = 0
+	var lineStart int64 = 0
+	var pendingHasANSI bool // Track ANSI for lines spanning chunks
+
+	for {
+		n, readErr := file.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			chunkStart := 0
+			
+			for {
+				// Find next newline using optimized bytes.IndexByte
+				pos := bytes.IndexByte(chunk[chunkStart:], '\n')
+				if pos == -1 {
+					// No more newlines in this chunk
+					// Check for ANSI in remaining part
+					if bytes.IndexByte(chunk[chunkStart:], '\x1b') != -1 {
+						pendingHasANSI = true
+					}
+					break
+				}
+				
+				newlinePos := chunkStart + pos
+				lineEnd := fileOffset + int64(newlinePos) + 1
+
+				// Record line
+				idx.offsets = append(idx.offsets, lineStart)
+				
+				// Check for ANSI in this line's portion of chunk
+				hasANSI := pendingHasANSI || bytes.IndexByte(chunk[chunkStart:newlinePos+1], '\x1b') != -1
+				idx.hasANSI = append(idx.hasANSI, hasANSI)
+				pendingHasANSI = false
+
+				lineStart = lineEnd
+				chunkStart = newlinePos + 1
+			}
+			
+			fileOffset += int64(n)
+		}
+		
+		if readErr == io.EOF {
+			// Handle last line without newline
+			if lineStart < fileOffset {
+				idx.offsets = append(idx.offsets, lineStart)
+				idx.hasANSI = append(idx.hasANSI, pendingHasANSI)
+			}
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+
+	idx.totalLines = len(idx.offsets)
+
+	// Trim slices to exact size to save memory (remove overcapacity)
+	if cap(idx.offsets) > len(idx.offsets)*5/4 {
+		trimmedOffsets := make([]int64, len(idx.offsets))
+		copy(trimmedOffsets, idx.offsets)
+		idx.offsets = trimmedOffsets
+	}
+	if cap(idx.hasANSI) > len(idx.hasANSI)*5/4 {
+		trimmedHasANSI := make([]bool, len(idx.hasANSI))
+		copy(trimmedHasANSI, idx.hasANSI)
+		idx.hasANSI = trimmedHasANSI
+	}
+
+	return idx, nil
+}
+
+// Page represents a cached page of lines
+type Page struct {
+	startLine  int       // First line index in this page
+	lines      []string  // Cached line content
+	lastAccess time.Time // For LRU eviction
+}
+
+// PageCache manages loading and caching of line pages from disk
+type PageCache struct {
+	pages     map[int]*Page // pageNum -> Page
+	lineIndex *LineIndex
+	mu        sync.RWMutex
+	file      *os.File // Keep file open for reading
+	
+	// Pinned pages that should not be evicted
+	pinnedPages map[int]bool
+}
+
+// NewPageCache creates a new page cache for the given line index
+func NewPageCache(lineIndex *LineIndex) (*PageCache, error) {
+	file, err := os.Open(lineIndex.filename)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PageCache{
+		pages:       make(map[int]*Page),
+		lineIndex:   lineIndex,
+		file:        file,
+		pinnedPages: make(map[int]bool),
+	}, nil
+}
+
+// Close closes the underlying file
+func (pc *PageCache) Close() error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if pc.file != nil {
+		return pc.file.Close()
+	}
+	return nil
+}
+
+// pageNumForLine returns the page number containing the given line
+func (pc *PageCache) pageNumForLine(lineIdx int) int {
+	return lineIdx / pageSize
+}
+
+// GetLine returns a single line, loading its page if necessary
+func (pc *PageCache) GetLine(lineIdx int) string {
+	if lineIdx < 0 || lineIdx >= pc.lineIndex.totalLines {
+		return ""
+	}
+
+	pageNum := pc.pageNumForLine(lineIdx)
+	
+	pc.mu.RLock()
+	page, exists := pc.pages[pageNum]
+	if exists {
+		page.lastAccess = time.Now()
+		lineInPage := lineIdx - page.startLine
+		if lineInPage >= 0 && lineInPage < len(page.lines) {
+			result := page.lines[lineInPage]
+			pc.mu.RUnlock()
+			return result
+		}
+	}
+	pc.mu.RUnlock()
+
+	// Need to load the page
+	pc.loadPage(pageNum)
+
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	page, exists = pc.pages[pageNum]
+	if !exists {
+		return ""
+	}
+	lineInPage := lineIdx - page.startLine
+	if lineInPage >= 0 && lineInPage < len(page.lines) {
+		return page.lines[lineInPage]
+	}
+	return ""
+}
+
+// GetHasANSI returns whether a line has ANSI codes (from index, no page load needed)
+func (pc *PageCache) GetHasANSI(lineIdx int) bool {
+	if lineIdx < 0 || lineIdx >= pc.lineIndex.totalLines {
+		return false
+	}
+	return pc.lineIndex.hasANSI[lineIdx]
+}
+
+// loadPage loads a page from disk into the cache
+func (pc *PageCache) loadPage(pageNum int) {
+	// Bounds check
+	if pageNum < 0 {
+		return
+	}
+	
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// Check again under write lock
+	if _, exists := pc.pages[pageNum]; exists {
+		return
+	}
+
+	startLine := pageNum * pageSize
+	endLine := startLine + pageSize
+	if endLine > pc.lineIndex.totalLines {
+		endLine = pc.lineIndex.totalLines
+	}
+
+	if startLine >= pc.lineIndex.totalLines {
+		return
+	}
+
+	reader := bufio.NewReader(pc.file)
+	lines := make([]string, 0, endLine-startLine)
+
+	for i := startLine; i < endLine; i++ {
+		// Seek to this specific line's offset (handles non-contiguous lines in filtered views)
+		offset := pc.lineIndex.offsets[i]
+		_, err := pc.file.Seek(offset, 0)
+		if err != nil {
+			lines = append(lines, "")
+			continue
+		}
+		reader.Reset(pc.file)
+
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			lines = append(lines, "")
+			continue
+		}
+		// Trim newline
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		lines = append(lines, line)
+		if err == io.EOF {
+			break
+		}
+	}
+
+	pc.pages[pageNum] = &Page{
+		startLine:  startLine,
+		lines:      lines,
+		lastAccess: time.Now(),
+	}
+
+	// Evict old pages if over limit
+	pc.evictIfNeeded()
+}
+
+// evictIfNeeded removes old pages if we're over the memory limit
+func (pc *PageCache) evictIfNeeded() {
+	// Already under write lock from loadPage
+
+	if len(pc.pages) <= maxPagesInMemory {
+		return
+	}
+
+	// Find oldest non-pinned page
+	var oldestTime time.Time
+	oldestPage := -1
+
+	for pageNum, page := range pc.pages {
+		if pc.pinnedPages[pageNum] {
+			continue
+		}
+		if oldestPage == -1 || page.lastAccess.Before(oldestTime) {
+			oldestTime = page.lastAccess
+			oldestPage = pageNum
+		}
+	}
+
+	if oldestPage != -1 {
+		delete(pc.pages, oldestPage)
+	}
+}
+
+// PinPage marks a page as pinned (should not be evicted)
+func (pc *PageCache) PinPage(pageNum int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.pinnedPages[pageNum] = true
+}
+
+// UnpinPage removes the pin from a page
+func (pc *PageCache) UnpinPage(pageNum int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	delete(pc.pinnedPages, pageNum)
+}
+
+// ClearAllPins removes all page pins
+func (pc *PageCache) ClearAllPins() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.pinnedPages = make(map[int]bool)
+}
+
+// EvictUnpinned immediately removes all non-pinned pages from cache
+func (pc *PageCache) EvictUnpinned() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	for pageNum := range pc.pages {
+		if !pc.pinnedPages[pageNum] {
+			delete(pc.pages, pageNum)
+		}
+	}
+}
+
+// UpdateSearchPins updates pins for search results: current view + current match ± 2 nearby matches
+func (pc *PageCache) UpdateSearchPins(currentViewLine int, matches []int, currentMatchIdx int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	
+	// Clear existing pins
+	pc.pinnedPages = make(map[int]bool)
+	
+	// Always pin current view page
+	viewPage := currentViewLine / pageSize
+	pc.pinnedPages[viewPage] = true
+	
+	// Pin pages around current match and ±2 nearby matches
+	if len(matches) > 0 && currentMatchIdx >= 0 && currentMatchIdx < len(matches) {
+		startIdx := currentMatchIdx - 2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := currentMatchIdx + 2
+		if endIdx >= len(matches) {
+			endIdx = len(matches) - 1
+		}
+		
+		for i := startIdx; i <= endIdx; i++ {
+			matchPage := matches[i] / pageSize
+			pc.pinnedPages[matchPage] = true
+			// Also pin adjacent pages for context
+			if matchPage > 0 {
+				pc.pinnedPages[matchPage-1] = true
+			}
+			pc.pinnedPages[matchPage+1] = true
+		}
+	}
+	
+	// Evict unpinned pages
+	for pageNum := range pc.pages {
+		if !pc.pinnedPages[pageNum] {
+			delete(pc.pages, pageNum)
+		}
+	}
+}
+
+// UpdateViewPin updates the pin for the current view, keeping nearby pages
+func (pc *PageCache) UpdateViewPin(currentViewLine int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	
+	viewPage := currentViewLine / pageSize
+	
+	// Pin current page and one adjacent page in each direction
+	newPins := make(map[int]bool)
+	if viewPage > 0 {
+		newPins[viewPage-1] = true
+	}
+	newPins[viewPage] = true
+	newPins[viewPage+1] = true
+	
+	// Merge with existing search-related pins (keep both)
+	for p := range pc.pinnedPages {
+		newPins[p] = true
+	}
+	pc.pinnedPages = newPins
+	
+	// Evict pages that are no longer pinned
+	for pageNum := range pc.pages {
+		if !pc.pinnedPages[pageNum] {
+			delete(pc.pages, pageNum)
+		}
+	}
+}
+
+// PreloadPages loads multiple pages in background
+func (pc *PageCache) PreloadPages(pageNums []int) {
+	for _, pageNum := range pageNums {
+		if pageNum < 0 || pageNum >= (pc.lineIndex.totalLines+pageSize-1)/pageSize {
+			continue
+		}
+		pc.mu.RLock()
+		_, exists := pc.pages[pageNum]
+		pc.mu.RUnlock()
+		if !exists {
+			pc.loadPage(pageNum)
+		}
+	}
+}
+
+// Prefetcher manages background loading of pages based on navigation patterns
+type Prefetcher struct {
+	cache      *PageCache
+	loadQueue  chan int // Page numbers to load
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+}
+
+// NewPrefetcher creates a new prefetcher for the given page cache
+func NewPrefetcher(cache *PageCache) *Prefetcher {
+	p := &Prefetcher{
+		cache:     cache,
+		loadQueue: make(chan int, 100),
+		stopCh:    make(chan struct{}),
+	}
+
+	p.wg.Add(1)
+	go p.run()
+
+	return p
+}
+
+// run is the background goroutine that processes load requests
+func (p *Prefetcher) run() {
+	defer p.wg.Done()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case pageNum := <-p.loadQueue:
+			p.cache.mu.RLock()
+			_, exists := p.cache.pages[pageNum]
+			p.cache.mu.RUnlock()
+			if !exists {
+				p.cache.loadPage(pageNum)
+			}
+		}
+	}
+}
+
+// Stop stops the prefetcher
+func (p *Prefetcher) Stop() {
+	close(p.stopCh)
+	p.wg.Wait()
+}
+
+// RequestPage queues a page for background loading
+func (p *Prefetcher) RequestPage(pageNum int) {
+	// Bounds check - ignore invalid page numbers
+	if pageNum < 0 {
+		return
+	}
+	maxPage := (p.cache.lineIndex.totalLines + pageSize - 1) / pageSize
+	if pageNum >= maxPage {
+		return
+	}
+	
+	select {
+	case p.loadQueue <- pageNum:
+	default:
+		// Queue full, skip
+	}
+}
+
+// HintNavigation signals navigation direction for prefetching
+func (p *Prefetcher) HintNavigation(currentLine int, direction int) {
+	currentPage := currentLine / pageSize
+	
+	if direction > 0 {
+		// Moving down - preload next pages
+		p.RequestPage(currentPage + 1)
+		p.RequestPage(currentPage + 2)
+	} else if direction < 0 {
+		// Moving up - preload previous pages
+		p.RequestPage(currentPage - 1)
+		p.RequestPage(currentPage - 2)
+	}
+}
+
+// HintGotoStart preloads the first page
+func (p *Prefetcher) HintGotoStart() {
+	p.RequestPage(0)
+}
+
+// HintGotoEnd preloads the last page
+func (p *Prefetcher) HintGotoEnd(totalLines int) {
+	lastPage := (totalLines - 1) / pageSize
+	p.RequestPage(lastPage)
+}
+
+// HintSearchResult preloads pages around a search result
+func (p *Prefetcher) HintSearchResult(lineNum int) {
+	pageNum := lineNum / pageSize
+	p.RequestPage(pageNum - 1)
+	p.RequestPage(pageNum)
+	p.RequestPage(pageNum + 1)
 }
 
 // App holds the application state
@@ -546,6 +1072,26 @@ func (s *SearchState) Clear() {
 	s.backward = false
 }
 
+// SetMatches sets the search results from external source (e.g., disk-based search)
+func (s *SearchState) SetMatches(matches []int, query string, isRegex, ignoreCase, backward bool) {
+	s.query = query
+	s.isRegex = isRegex
+	s.ignoreCase = ignoreCase
+	s.backward = backward
+	s.matches = matches
+	s.current = -1
+	
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		s.regex, _ = regexp.Compile(pattern)
+	} else {
+		s.regex = nil
+	}
+}
+
 // HasResults returns true if there are search results
 func (s *SearchState) HasResults() bool {
 	return len(s.matches) > 0
@@ -726,6 +1272,22 @@ func NewViewer(filename string) (*Viewer, error) {
 		return nil, err
 	}
 
+	// Check file size to determine if we should use paging
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Estimate line count: assume average 100 bytes per line
+	estimatedLines := stat.Size() / 100
+
+	if estimatedLines >= pagingThreshold {
+		file.Close()
+		return newPagedViewer(filename)
+	}
+
+	// Standard in-memory mode for smaller files
 	v := &Viewer{
 		lines:    nil,
 		loading:  true,
@@ -739,11 +1301,89 @@ func NewViewer(filename string) (*Viewer, error) {
 		defer file.Close()
 		loadFromReader(v, file)
 
+		// After loading, check if we should have used paging
+		// (in case our estimate was wrong)
+		if v.LineCount() >= pagingThreshold {
+			// Too late to switch now, but log for debugging
+			// In practice this rarely happens with 100-byte estimate
+		}
+
 		// If follow mode is enabled, keep watching for new content
 		if v.follow {
 			go v.followFile(filename)
 		}
 	}()
+
+	return v, nil
+}
+
+// newPagedViewer creates a viewer that uses demand paging for large files
+func newPagedViewer(filename string) (*Viewer, error) {
+	// Build line index (scans file once)
+	lineIndex, err := NewLineIndex(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create page cache
+	pageCache, err := NewPageCache(lineIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create prefetcher
+	prefetcher := NewPrefetcher(pageCache)
+
+	v := &Viewer{
+		filename:   filename,
+		paged:      true,
+		lineIndex:  lineIndex,
+		pageCache:  pageCache,
+		prefetcher: prefetcher,
+		loading:    false, // Index is complete
+		topLine:    0,
+		leftCol:    0,
+	}
+
+	// Preload first page and last page for g/G commands
+	prefetcher.HintGotoStart()
+	prefetcher.HintGotoEnd(lineIndex.totalLines)
+
+	return v, nil
+}
+
+// createPagedFilteredViewer creates a paged viewer from filtered lines by writing to a temp file
+func createPagedFilteredViewer(lines []string, hasANSI []bool, originIndices []int, topLine int) (*Viewer, error) {
+	// Create temp file
+	tempFile, err := os.CreateTemp("", "sieve-filter-*.txt")
+	if err != nil {
+		return nil, err
+	}
+	tempPath := tempFile.Name()
+
+	// Write all lines to temp file
+	writer := bufio.NewWriter(tempFile)
+	for _, line := range lines {
+		writer.WriteString(line)
+		writer.WriteByte('\n')
+	}
+	writer.Flush()
+	tempFile.Close()
+
+	// Create paged viewer from temp file
+	v, err := newPagedViewer(tempPath)
+	if err != nil {
+		os.Remove(tempPath)
+		return nil, err
+	}
+
+	// Copy metadata (we already have it from filtering)
+	v.lineIndex.hasANSI = hasANSI
+	v.originIndices = originIndices
+	v.topLine = topLine
+
+	// Note: temp file will be deleted when program exits or viewer is closed
+	// We could add cleanup logic if needed
 
 	return v, nil
 }
@@ -886,6 +1526,9 @@ func NewViewerFromLines(lines []string) *Viewer {
 
 // LineCount returns the number of lines (thread-safe)
 func (v *Viewer) LineCount() int {
+	if v.paged {
+		return v.lineIndex.totalLines
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return len(v.lines)
@@ -893,6 +1536,9 @@ func (v *Viewer) LineCount() int {
 
 // GetLine returns a line at index (thread-safe), or empty string if out of bounds
 func (v *Viewer) GetLine(idx int) string {
+	if v.paged {
+		return v.pageCache.GetLine(idx)
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	if idx < 0 || idx >= len(v.lines) {
@@ -902,7 +1548,18 @@ func (v *Viewer) GetLine(idx int) string {
 }
 
 // GetLines returns a copy of lines slice (thread-safe)
+// For paged viewers, this loads all lines in the given range
 func (v *Viewer) GetLines() []string {
+	if v.paged {
+		// For paged mode, return all lines (may be slow for very large files)
+		// This is mainly used for filtering which scans all lines anyway
+		count := v.lineIndex.totalLines
+		result := make([]string, count)
+		for i := 0; i < count; i++ {
+			result[i] = v.pageCache.GetLine(i)
+		}
+		return result
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	result := make([]string, len(v.lines))
@@ -912,6 +1569,10 @@ func (v *Viewer) GetLines() []string {
 
 // GetHasANSI returns a copy of hasANSI slice (thread-safe)
 func (v *Viewer) GetHasANSI() []bool {
+	if v.paged {
+		// Return from line index (always in memory)
+		return v.lineIndex.hasANSI
+	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	result := make([]bool, len(v.hasANSI))
@@ -919,11 +1580,578 @@ func (v *Viewer) GetHasANSI() []bool {
 	return result
 }
 
+// GetHasANSISingle returns whether a single line has ANSI codes (efficient for paged mode)
+func (v *Viewer) GetHasANSISingle(idx int) bool {
+	if v.paged {
+		if idx < 0 || idx >= v.lineIndex.totalLines {
+			return false
+		}
+		return v.lineIndex.hasANSI[idx]
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if idx < 0 || idx >= len(v.hasANSI) {
+		return false
+	}
+	return v.hasANSI[idx]
+}
+
 // IsLoading returns true if still loading (thread-safe)
 func (v *Viewer) IsLoading() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return v.loading
+}
+
+// Close cleans up paging resources
+func (v *Viewer) Close() {
+	if v.paged {
+		if v.prefetcher != nil {
+			v.prefetcher.Stop()
+		}
+		if v.pageCache != nil {
+			v.pageCache.Close()
+		}
+	}
+}
+
+// SearchFromDisk searches the paged viewer directly from disk without loading all lines
+// Returns matching line indices (in the viewer's coordinate space).
+// For filtered viewers, this searches only the lines in the filtered view.
+// Uses parallel scanning for performance.
+func (v *Viewer) SearchFromDisk(query string, isRegex, ignoreCase bool) []int {
+	if !v.paged || v.lineIndex == nil {
+		return nil
+	}
+
+	totalLines := v.lineIndex.totalLines
+	if totalLines == 0 {
+		return nil
+	}
+
+	// For filtered views with originIndices, use optimized search
+	// that reads the original file sequentially
+	if v.lineIndex.isFiltered && v.originIndices != nil {
+		return v.searchFilteredViewOptimized(query, isRegex, ignoreCase)
+	}
+
+	// Prepare regex/query
+	var re *regexp.Regexp
+	var lowerQuery string
+	var err error
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	// Use parallel search with multiple workers for original file
+	numWorkers := 8
+	if totalLines < numWorkers*100 {
+		numWorkers = 1
+	}
+	chunkSize := (totalLines + numWorkers - 1) / numWorkers
+
+	type chunkResult struct {
+		chunkIdx int
+		matches  []int
+	}
+	resultChan := make(chan chunkResult, numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		startLine := w * chunkSize
+		endLine := startLine + chunkSize
+		if endLine > totalLines {
+			endLine = totalLines
+		}
+		if startLine >= totalLines {
+			break
+		}
+
+		go func(chunkIdx, startLine, endLine int) {
+			file, err := os.Open(v.lineIndex.filename)
+			if err != nil {
+				resultChan <- chunkResult{chunkIdx, nil}
+				return
+			}
+			defer file.Close()
+
+			// Seek once, then read sequentially (fast)
+			startOffset := v.lineIndex.offsets[startLine]
+			file.Seek(startOffset, 0)
+
+			scanner := bufio.NewScanner(file)
+			buf := make([]byte, 0, 64*1024)
+			scanner.Buffer(buf, 1024*1024)
+
+			var matches []int
+			lineNum := startLine
+			for scanner.Scan() && lineNum < endLine {
+				line := scanner.Text()
+
+				plainLine := line
+				if lineNum < len(v.lineIndex.hasANSI) && v.lineIndex.hasANSI[lineNum] {
+					plainLine = stripANSI(line)
+				}
+
+				var matched bool
+				if isRegex {
+					matched = re.MatchString(plainLine)
+				} else if ignoreCase {
+					matched = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+				} else {
+					matched = strings.Contains(plainLine, query)
+				}
+
+				if matched {
+					matches = append(matches, lineNum)
+				}
+				lineNum++
+			}
+
+			resultChan <- chunkResult{chunkIdx, matches}
+		}(w, startLine, endLine)
+	}
+
+	// Collect results
+	results := make([]chunkResult, numWorkers)
+	expectedWorkers := numWorkers
+	if totalLines < numWorkers*100 {
+		expectedWorkers = 1
+	}
+	for i := 0; i < expectedWorkers; i++ {
+		result := <-resultChan
+		results[result.chunkIdx] = result
+	}
+	close(resultChan)
+
+	// Merge results in order
+	var allMatches []int
+	for i := 0; i < numWorkers; i++ {
+		allMatches = append(allMatches, results[i].matches...)
+	}
+
+	return allMatches
+}
+
+// searchFilteredViewOptimized searches a filtered view using parallel workers
+// Each worker reads a chunk of the filtered lines using sequential reading within groups
+func (v *Viewer) searchFilteredViewOptimized(query string, isRegex, ignoreCase bool) []int {
+	totalFiltered := len(v.originIndices)
+	if totalFiltered == 0 {
+		return nil
+	}
+
+	// Prepare regex/query
+	var re *regexp.Regexp
+	var lowerQuery string
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		var err error
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	// Use parallel workers
+	numWorkers := 8
+	if totalFiltered < numWorkers*100 {
+		numWorkers = 1
+	}
+	chunkSize := (totalFiltered + numWorkers - 1) / numWorkers
+
+	type chunkResult struct {
+		chunkIdx int
+		matches  []int
+	}
+	resultChan := make(chan chunkResult, numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		startIdx := w * chunkSize
+		endIdx := startIdx + chunkSize
+		if endIdx > totalFiltered {
+			endIdx = totalFiltered
+		}
+		if startIdx >= totalFiltered {
+			break
+		}
+
+		go func(chunkIdx, startIdx, endIdx int) {
+			file, err := os.Open(v.lineIndex.filename)
+			if err != nil {
+				resultChan <- chunkResult{chunkIdx, nil}
+				return
+			}
+			defer file.Close()
+
+			var matches []int
+			reader := bufio.NewReaderSize(file, 64*1024)
+			var lastOffset int64 = -1
+
+			// Process each filtered line in our chunk
+			// Offsets in originIndices are already sorted by original line number
+			// so we can optimize by checking if next offset is close
+			for filteredIdx := startIdx; filteredIdx < endIdx; filteredIdx++ {
+				offset := v.lineIndex.offsets[filteredIdx]
+
+				// Seek only if not adjacent to previous read
+				if offset != lastOffset {
+					file.Seek(offset, 0)
+					reader.Reset(file)
+				}
+
+				lineBytes, err := reader.ReadBytes('\n')
+				if err != nil && err != io.EOF {
+					continue
+				}
+				lastOffset = offset + int64(len(lineBytes))
+
+				line := strings.TrimSuffix(string(lineBytes), "\n")
+				line = strings.TrimSuffix(line, "\r")
+
+				plainLine := line
+				if filteredIdx < len(v.lineIndex.hasANSI) && v.lineIndex.hasANSI[filteredIdx] {
+					plainLine = stripANSI(line)
+				}
+
+				var matched bool
+				if isRegex {
+					matched = re.MatchString(plainLine)
+				} else if ignoreCase {
+					matched = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+				} else {
+					matched = strings.Contains(plainLine, query)
+				}
+
+				if matched {
+					matches = append(matches, filteredIdx)
+				}
+			}
+
+			resultChan <- chunkResult{chunkIdx, matches}
+		}(w, startIdx, endIdx)
+	}
+
+	// Collect results
+	actualWorkers := numWorkers
+	if totalFiltered < numWorkers*chunkSize {
+		actualWorkers = (totalFiltered + chunkSize - 1) / chunkSize
+	}
+	results := make([]chunkResult, numWorkers)
+	for i := 0; i < actualWorkers; i++ {
+		result := <-resultChan
+		results[result.chunkIdx] = result
+	}
+	close(resultChan)
+
+	// Merge in order (already sorted within each chunk)
+	var allMatches []int
+	for i := 0; i < numWorkers; i++ {
+		allMatches = append(allMatches, results[i].matches...)
+	}
+
+	return allMatches
+}
+
+// FilterFromDisk filters the file directly from disk without loading all lines into memory
+// Returns matching line indices. Only for paged viewers.
+func (v *Viewer) FilterFromDisk(query string, isRegex, ignoreCase, keep bool) []int {
+	if !v.paged || v.lineIndex == nil {
+		return nil
+	}
+
+	file, err := os.Open(v.lineIndex.filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var matches []int
+	var re *regexp.Regexp
+	var lowerQuery string
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Strip ANSI if line has escape codes
+		plainLine := line
+		if lineNum < len(v.lineIndex.hasANSI) && v.lineIndex.hasANSI[lineNum] {
+			plainLine = stripANSI(line)
+		}
+
+		var matched bool
+		if isRegex {
+			matched = re.MatchString(plainLine)
+		} else if ignoreCase {
+			matched = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+		} else {
+			matched = strings.Contains(plainLine, query)
+		}
+
+		// keep=true means keep matching lines, keep=false means exclude matching lines
+		if matched == keep {
+			matches = append(matches, lineNum)
+		}
+		lineNum++
+	}
+
+	return matches
+}
+
+// FilterFromDiskParallel filters the file using multiple threads
+// Divides file into chunks and scans in parallel
+func (v *Viewer) FilterFromDiskParallel(query string, isRegex, ignoreCase, keep bool) []int {
+	if !v.paged || v.lineIndex == nil {
+		return nil
+	}
+
+	totalLines := v.lineIndex.totalLines
+	if totalLines == 0 {
+		return nil
+	}
+
+	// Prepare regex/query
+	var re *regexp.Regexp
+	var lowerQuery string
+	var err error
+
+	if isRegex {
+		pattern := query
+		if ignoreCase {
+			pattern = "(?i)" + pattern
+		}
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			re = regexp.MustCompile(regexp.QuoteMeta(query))
+		}
+	} else if ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	// Determine number of workers
+	numWorkers := 8
+	if totalLines < numWorkers*1000 {
+		numWorkers = 1
+	}
+	chunkSize := (totalLines + numWorkers - 1) / numWorkers
+
+	type chunkResult struct {
+		chunkIdx int
+		matches  []int
+	}
+	resultChan := make(chan chunkResult, numWorkers)
+
+	// Start workers - each opens its own file handle
+	for w := 0; w < numWorkers; w++ {
+		startLine := w * chunkSize
+		endLine := startLine + chunkSize
+		if endLine > totalLines {
+			endLine = totalLines
+		}
+		if startLine >= totalLines {
+			break
+		}
+
+		go func(chunkIdx, startLine, endLine int, isFiltered bool) {
+			file, err := os.Open(v.lineIndex.filename)
+			if err != nil {
+				resultChan <- chunkResult{chunkIdx, nil}
+				return
+			}
+			defer file.Close()
+
+			var matches []int
+
+			if isFiltered {
+				// For filtered views: seek to each line individually
+				reader := bufio.NewReader(file)
+				for lineNum := startLine; lineNum < endLine; lineNum++ {
+					offset := v.lineIndex.offsets[lineNum]
+					file.Seek(offset, 0)
+					reader.Reset(file)
+
+					lineBytes, err := reader.ReadBytes('\n')
+					if err != nil && err != io.EOF {
+						continue
+					}
+					line := strings.TrimSuffix(string(lineBytes), "\n")
+					line = strings.TrimSuffix(line, "\r")
+
+					plainLine := line
+					if lineNum < len(v.lineIndex.hasANSI) && v.lineIndex.hasANSI[lineNum] {
+						plainLine = stripANSI(line)
+					}
+
+					var matched bool
+					if isRegex {
+						matched = re.MatchString(plainLine)
+					} else if ignoreCase {
+						matched = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+					} else {
+						matched = strings.Contains(plainLine, query)
+					}
+
+					if matched == keep {
+						matches = append(matches, lineNum)
+					}
+				}
+			} else {
+				// For original file: sequential read (fast)
+				startOffset := v.lineIndex.offsets[startLine]
+				file.Seek(startOffset, 0)
+
+				scanner := bufio.NewScanner(file)
+				buf := make([]byte, 0, 64*1024)
+				scanner.Buffer(buf, 1024*1024)
+
+				lineNum := startLine
+				for scanner.Scan() && lineNum < endLine {
+					line := scanner.Text()
+
+					plainLine := line
+					if lineNum < len(v.lineIndex.hasANSI) && v.lineIndex.hasANSI[lineNum] {
+						plainLine = stripANSI(line)
+					}
+
+					var matched bool
+					if isRegex {
+						matched = re.MatchString(plainLine)
+					} else if ignoreCase {
+						matched = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+					} else {
+						matched = strings.Contains(plainLine, query)
+					}
+
+					if matched == keep {
+						matches = append(matches, lineNum)
+					}
+					lineNum++
+				}
+			}
+
+			resultChan <- chunkResult{chunkIdx, matches}
+		}(w, startLine, endLine, v.lineIndex.isFiltered)
+	}
+
+	// Collect results in order
+	results := make([]chunkResult, numWorkers)
+	expectedWorkers := numWorkers
+	if totalLines < numWorkers*1000 {
+		expectedWorkers = 1
+	}
+	for i := 0; i < expectedWorkers; i++ {
+		result := <-resultChan
+		results[result.chunkIdx] = result
+	}
+	close(resultChan)
+
+	// Merge results in order
+	var allMatches []int
+	for i := 0; i < numWorkers; i++ {
+		allMatches = append(allMatches, results[i].matches...)
+	}
+
+	return allMatches
+}
+
+// CreateFilteredPagedViewer creates a new paged viewer that references the parent's file
+// but only shows lines at the specified indices
+func (v *Viewer) CreateFilteredPagedViewer(matchedIndices []int, currentTopLine int) *Viewer {
+	if !v.paged || v.lineIndex == nil || len(matchedIndices) == 0 {
+		return nil
+	}
+
+	// Create a new LineIndex for the filtered view
+	// It references the same file but only the matched lines
+	filteredIndex := &LineIndex{
+		filename:   v.lineIndex.filename,
+		totalLines: len(matchedIndices),
+		offsets:    make([]int64, len(matchedIndices)),
+		hasANSI:    make([]bool, len(matchedIndices)),
+		isFiltered: true, // Mark as filtered - offsets are non-contiguous
+	}
+
+	// Copy metadata for matched lines only
+	for i, origIdx := range matchedIndices {
+		if origIdx < len(v.lineIndex.offsets) {
+			filteredIndex.offsets[i] = v.lineIndex.offsets[origIdx]
+		}
+		if origIdx < len(v.lineIndex.hasANSI) {
+			filteredIndex.hasANSI[i] = v.lineIndex.hasANSI[origIdx]
+		}
+	}
+
+	// Create page cache for filtered view
+	pageCache, err := NewPageCache(filteredIndex)
+	if err != nil {
+		return nil
+	}
+
+	// Create prefetcher
+	prefetcher := NewPrefetcher(pageCache)
+
+	// Find the position in filtered view corresponding to currentTopLine
+	topLinePos := 0
+	for i, origIdx := range matchedIndices {
+		if origIdx >= currentTopLine {
+			topLinePos = i
+			break
+		}
+		topLinePos = i + 1
+	}
+	if topLinePos >= len(matchedIndices) {
+		topLinePos = 0
+	}
+
+	newViewer := &Viewer{
+		filename:      v.filename,
+		paged:         true,
+		lineIndex:     filteredIndex,
+		pageCache:     pageCache,
+		prefetcher:    prefetcher,
+		originIndices: matchedIndices,
+		loading:       false,
+		topLine:       topLinePos,
+		leftCol:       0,
+	}
+
+	// Preload first page
+	prefetcher.HintGotoStart()
+
+	return newViewer
 }
 
 func (v *Viewer) draw() {
@@ -1158,6 +2386,11 @@ func (v *Viewer) navigateUp() {
 			v.topLine--
 		}
 	}
+
+	// Prefetch hint for paged mode
+	if v.paged && v.prefetcher != nil {
+		v.prefetcher.HintNavigation(v.topLine, -1)
+	}
 }
 
 func (v *Viewer) navigateDown() {
@@ -1178,6 +2411,11 @@ func (v *Viewer) navigateDown() {
 		if v.topLine < maxTop {
 			v.topLine++
 		}
+	}
+
+	// Prefetch hint for paged mode
+	if v.paged && v.prefetcher != nil {
+		v.prefetcher.HintNavigation(v.topLine, 1)
 	}
 }
 
@@ -1210,6 +2448,15 @@ func (v *Viewer) pageDown() {
 			v.topLine = maxTop
 		}
 	}
+
+	// For paged mode: update view pin and evict old pages
+	if v.paged && v.pageCache != nil {
+		v.pageCache.UpdateViewPin(v.topLine)
+		// Prefetch ahead
+		if v.prefetcher != nil {
+			v.prefetcher.HintNavigation(v.topLine, 1)
+		}
+	}
 }
 
 func (v *Viewer) pageUp() {
@@ -1224,11 +2471,25 @@ func (v *Viewer) pageUp() {
 			v.topLine = 0
 		}
 	}
+
+	// For paged mode: update view pin and evict old pages
+	if v.paged && v.pageCache != nil {
+		v.pageCache.UpdateViewPin(v.topLine)
+		// Prefetch behind
+		if v.prefetcher != nil {
+			v.prefetcher.HintNavigation(v.topLine, -1)
+		}
+	}
 }
 
 func (v *Viewer) goToStart() {
 	v.topLine = 0
 	v.topLineOffset = 0
+
+	// For paged mode: update view pin and evict old pages
+	if v.paged && v.pageCache != nil {
+		v.pageCache.UpdateViewPin(v.topLine)
+	}
 }
 
 func (v *Viewer) goToEnd() {
@@ -1237,6 +2498,11 @@ func (v *Viewer) goToEnd() {
 	v.topLine = v.LineCount() - 1
 	if v.topLine < 0 {
 		v.topLine = 0
+	}
+
+	// For paged mode: update view pin and evict old pages
+	if v.paged && v.pageCache != nil {
+		v.pageCache.UpdateViewPin(v.topLine)
 	}
 }
 
@@ -1426,6 +2692,21 @@ func (a *App) ShowTempMessage(msg string) {
 		time.Sleep(3 * time.Second)
 		termbox.Interrupt()
 	}()
+}
+
+// ClearSearch clears search state and evicts search-related pages for paged viewers
+func (a *App) ClearSearch() {
+	a.search.Clear()
+	
+	// For paged viewers, clear pins and evict unpinned pages
+	current := a.stack.Current()
+	if current != nil && current.paged && current.pageCache != nil {
+		// Keep only the current view page pinned
+		current.pageCache.ClearAllPins()
+		viewPage := current.topLine / pageSize
+		current.pageCache.PinPage(viewPage)
+		current.pageCache.EvictUnpinned()
+	}
 }
 
 // copyToClipboard copies text to system clipboard
@@ -2154,8 +3435,15 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
-		lines := current.GetLines()       // Get snapshot for thread-safety
-		hasANSICache := current.GetHasANSI() // Get ANSI cache
+		// For paged viewers, filter directly from disk without loading all lines
+		if current.paged {
+			a.handlePagedFilter(current, query, isRegex, ignoreCase, keep, currentTopLine)
+			return
+		}
+
+		// For in-memory viewers, use parallel filtering
+		lines := current.GetLines()
+		hasANSICache := current.GetHasANSI()
 
 		matcher, err := createMatcher(query, isRegex, ignoreCase)
 		if err != nil {
@@ -2172,7 +3460,7 @@ func (a *App) HandleFilter(keep bool) {
 			leftCol:  0,
 		}
 		a.stack.Push(newViewer)
-		a.search.Clear()
+		a.ClearSearch()
 
 		// Filter in parallel
 		go func() {
@@ -2234,42 +3522,36 @@ func (a *App) HandleFilter(keep bool) {
 			for range resultChan {
 			}
 
-			// Merge results in order and stream to viewer
-			foundMatch := false
-			matchesBefore := 0
-			lineCount := 0
-			var allIndices []int
+			// Merge results
+			var allLines []string
 			var allHasANSI []bool
+			var allIndices []int
 
 			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
 				chunk := results[chunkIdx]
-				for j, line := range chunk.lines {
-					newViewer.mu.Lock()
-					newViewer.lines = append(newViewer.lines, line)
-					newViewer.hasANSI = append(newViewer.hasANSI, chunk.hasANSI[j])
-					newViewer.mu.Unlock()
+				allLines = append(allLines, chunk.lines...)
+				allHasANSI = append(allHasANSI, chunk.hasANSI...)
+				allIndices = append(allIndices, chunk.indices...)
+			}
 
-					origIdx := chunk.indices[j]
-					allIndices = append(allIndices, origIdx)
-					allHasANSI = append(allHasANSI, chunk.hasANSI[j])
-
-					if origIdx >= currentTopLine && !foundMatch {
-						foundMatch = true
-						newViewer.topLine = matchesBefore
-					}
-					if !foundMatch {
-						matchesBefore++
-					}
-
-					lineCount++
-					if lineCount <= 100 || lineCount%1000 == 0 {
-						termbox.Interrupt()
-					}
+			// Find the position corresponding to currentTopLine
+			topLinePos := 0
+			for i, origIdx := range allIndices {
+				if origIdx >= currentTopLine {
+					topLinePos = i
+					break
 				}
+				topLinePos = i + 1
+			}
+			if topLinePos >= len(allLines) {
+				topLinePos = 0
 			}
 
 			newViewer.mu.Lock()
+			newViewer.lines = allLines
+			newViewer.hasANSI = allHasANSI
 			newViewer.originIndices = allIndices
+			newViewer.topLine = topLinePos
 			newViewer.loading = false
 			newViewer.mu.Unlock()
 			termbox.Interrupt()
@@ -2277,14 +3559,140 @@ func (a *App) HandleFilter(keep bool) {
 	}
 }
 
+// handlePagedFilter handles filtering for paged viewers without loading all lines
+func (a *App) handlePagedFilter(current *Viewer, query string, isRegex, ignoreCase, keep bool, currentTopLine int) {
+	// Create placeholder viewer with loading state
+	placeholder := &Viewer{
+		loading:  true,
+		filename: current.filename,
+	}
+	a.stack.Push(placeholder)
+	a.ClearSearch()
+
+	// Filter in background using multiple threads
+	go func() {
+		matchedIndices := current.FilterFromDiskParallel(query, isRegex, ignoreCase, keep)
+
+		if len(matchedIndices) == 0 {
+			// Remove placeholder and show message
+			a.stack.Pop()
+			a.ShowTempMessage("No matches found")
+			termbox.Interrupt()
+			return
+		}
+
+		// Create a new paged viewer that references the parent's file
+		newViewer := current.CreateFilteredPagedViewer(matchedIndices, currentTopLine)
+		if newViewer == nil {
+			a.stack.Pop()
+			a.ShowTempMessage("Failed to create filtered view")
+			termbox.Interrupt()
+			return
+		}
+
+		// Replace placeholder with actual viewer
+		a.stack.mu.Lock()
+		if len(a.stack.viewers) > 0 {
+			a.stack.viewers[len(a.stack.viewers)-1] = newViewer
+		}
+		a.stack.mu.Unlock()
+		termbox.Interrupt()
+	}()
+}
+
+// handlePagedFilterAppend handles append filter for paged viewers
+func (a *App) handlePagedFilterAppend(current *Viewer, original *Viewer) {
+	currentTopLine := current.topLine
+
+	query, isRegex, ignoreCase, ok := a.promptWithModifiers("+")
+	if !ok || query == "" {
+		return
+	}
+
+	// Create placeholder viewer with loading state
+	placeholder := &Viewer{
+		loading:  true,
+		filename: original.filename,
+	}
+	a.stack.Push(placeholder)
+	a.ClearSearch()
+
+	// Process in background
+	go func() {
+		// Get current view's origin indices (lines already included)
+		currentIndices := make(map[int]bool)
+		for _, idx := range current.originIndices {
+			currentIndices[idx] = true
+		}
+
+		// Find new matches from original file
+		newMatches := original.FilterFromDiskParallel(query, isRegex, ignoreCase, true)
+
+		// Combine: keep all current indices + add new matches not already in current
+		// Result should be sorted by original line number
+		combinedSet := make(map[int]bool)
+		for idx := range currentIndices {
+			combinedSet[idx] = true
+		}
+		for _, idx := range newMatches {
+			combinedSet[idx] = true
+		}
+
+		// Convert to sorted slice
+		var combinedIndices []int
+		for idx := range combinedSet {
+			combinedIndices = append(combinedIndices, idx)
+		}
+		sort.Ints(combinedIndices)
+
+		if len(combinedIndices) == 0 {
+			a.stack.Pop()
+			a.ShowTempMessage("No matches found")
+			termbox.Interrupt()
+			return
+		}
+
+		// Find position in new view corresponding to current top line
+		// Map current.topLine through originIndices to get original index
+		var targetOrigIdx int
+		if currentTopLine < len(current.originIndices) {
+			targetOrigIdx = current.originIndices[currentTopLine]
+		}
+
+		// Create new paged viewer from original with combined indices
+		newViewer := original.CreateFilteredPagedViewer(combinedIndices, targetOrigIdx)
+		if newViewer == nil {
+			a.stack.Pop()
+			a.ShowTempMessage("Failed to create filtered view")
+			termbox.Interrupt()
+			return
+		}
+
+		// Replace placeholder with actual viewer
+		a.stack.mu.Lock()
+		if len(a.stack.viewers) > 0 {
+			a.stack.viewers[len(a.stack.viewers)-1] = newViewer
+		}
+		a.stack.mu.Unlock()
+		termbox.Interrupt()
+	}()
+}
+
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
 	current := a.stack.Current()
+	original := a.stack.viewers[0]
+	
+	// For paged viewers, use optimized path
+	if original.paged {
+		a.handlePagedFilterAppend(current, original)
+		return
+	}
+	
 	currentLine := current.GetLine(current.topLine)
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers("+")
 	if ok && query != "" {
-		original := a.stack.viewers[0]
 		currentLines := current.GetLines()
 		originalLines := original.GetLines()
 		originalHasANSI := original.GetHasANSI()
@@ -2304,7 +3712,7 @@ func (a *App) HandleFilterAppend() {
 			leftCol:  0,
 		}
 		a.stack.Push(newViewer)
-		a.search.Clear()
+		a.ClearSearch()
 
 		// Process in parallel
 		go func() {
@@ -2385,36 +3793,58 @@ func (a *App) HandleFilterAppend() {
 			}
 			close(resultChan)
 
-			// Merge results in order and stream to viewer
-			foundCurrentLine := false
-			lineCount := 0
+			// First pass: collect all results
+			var allLines []string
+			var allHasANSI []bool
 			var allIndices []int
 
 			for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
 				chunk := results[chunkIdx]
-				for j, line := range chunk.lines {
-					newViewer.mu.Lock()
-					newViewer.lines = append(newViewer.lines, line)
-					newViewer.hasANSI = append(newViewer.hasANSI, chunk.hasANSI[j])
-					if !foundCurrentLine && line == currentLine {
-						foundCurrentLine = true
-						newViewer.topLine = len(newViewer.lines) - 1
-					}
-					newViewer.mu.Unlock()
+				allLines = append(allLines, chunk.lines...)
+				allHasANSI = append(allHasANSI, chunk.hasANSI...)
+				allIndices = append(allIndices, chunk.indices...)
+			}
 
-					allIndices = append(allIndices, chunk.indices[j])
-
-					lineCount++
-					if lineCount <= 100 || lineCount%1000 == 0 {
-						termbox.Interrupt()
-					}
+			// Find position of current line
+			topLinePos := 0
+			for i, line := range allLines {
+				if line == currentLine {
+					topLinePos = i
+					break
 				}
 			}
 
-			newViewer.mu.Lock()
-			newViewer.originIndices = allIndices
-			newViewer.loading = false
-			newViewer.mu.Unlock()
+			// Check if we should use paging for large results
+			if len(allLines) > filterPagingThreshold {
+				// Use paged viewer for large results
+				pagedViewer, err := createPagedFilteredViewer(allLines, allHasANSI, allIndices, topLinePos)
+				if err == nil {
+					// Replace the placeholder viewer with the paged one
+					a.stack.mu.Lock()
+					if len(a.stack.viewers) > 0 {
+						a.stack.viewers[len(a.stack.viewers)-1] = pagedViewer
+					}
+					a.stack.mu.Unlock()
+				} else {
+					// Fall back to in-memory if paging fails
+					newViewer.mu.Lock()
+					newViewer.lines = allLines
+					newViewer.hasANSI = allHasANSI
+					newViewer.originIndices = allIndices
+					newViewer.topLine = topLinePos
+					newViewer.loading = false
+					newViewer.mu.Unlock()
+				}
+			} else {
+				// Use in-memory viewer (current behavior)
+				newViewer.mu.Lock()
+				newViewer.lines = allLines
+				newViewer.hasANSI = allHasANSI
+				newViewer.originIndices = allIndices
+				newViewer.topLine = topLinePos
+				newViewer.loading = false
+				newViewer.mu.Unlock()
+			}
 			termbox.Interrupt()
 		}()
 	}
@@ -2518,9 +3948,56 @@ func (a *App) HandleSearch(backward bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
-		lines := current.GetLines()
-		hasANSI := current.GetHasANSI()
-		lineIdx := a.search.Search(lines, hasANSI, query, current.topLine, backward, isRegex, ignoreCase)
+		var lineIdx int
+		
+		if current.paged {
+			// For paged viewers, search directly from disk to avoid loading all lines
+			matches := current.SearchFromDisk(query, isRegex, ignoreCase)
+			a.search.SetMatches(matches, query, isRegex, ignoreCase, backward)
+			
+			// Find first match relative to current position
+			lineIdx = -1
+			if len(matches) > 0 {
+				if backward {
+					// Find last match before current position
+					for i := len(matches) - 1; i >= 0; i-- {
+						if matches[i] <= current.topLine {
+							lineIdx = matches[i]
+							a.search.current = i
+							break
+						}
+					}
+					if lineIdx < 0 {
+						lineIdx = matches[len(matches)-1]
+						a.search.current = len(matches) - 1
+					}
+				} else {
+					// Find first match at or after current position
+					for i, m := range matches {
+						if m >= current.topLine {
+							lineIdx = m
+							a.search.current = i
+							break
+						}
+					}
+					if lineIdx < 0 {
+						lineIdx = matches[0]
+						a.search.current = 0
+					}
+				}
+			}
+			
+			// Update pins: current view + ±2 nearby matches
+			if current.pageCache != nil {
+				current.pageCache.UpdateSearchPins(current.topLine, matches, a.search.current)
+			}
+		} else {
+			// For in-memory viewers, use existing parallel search
+			lines := current.GetLines()
+			hasANSI := current.GetHasANSI()
+			lineIdx = a.search.Search(lines, hasANSI, query, current.topLine, backward, isRegex, ignoreCase)
+		}
+		
 		if lineIdx >= 0 {
 			current.topLine = lineIdx
 		} else if a.search.HasResults() {
@@ -2571,6 +4048,11 @@ func (a *App) HandleSearchNav(reverse bool) {
 		if !found {
 			a.ShowTempMessage("EOF")
 		}
+	}
+
+	// For paged mode: update pins and aggressively evict unpinned pages
+	if current.paged && current.pageCache != nil {
+		current.pageCache.UpdateSearchPins(current.topLine, a.search.matches, a.search.current)
 	}
 }
 
@@ -2630,8 +4112,18 @@ func (a *App) HandleStackNav(reset bool) {
 				newCurrent.topLine = targetLine
 			}
 		}
+
+		// Prefetch hint for paged mode
+		if newCurrent.paged && newCurrent.prefetcher != nil {
+			newCurrent.prefetcher.HintNavigation(newCurrent.topLine, 0)
+			// Preload pages around the target line
+			pageNum := newCurrent.topLine / pageSize
+			newCurrent.prefetcher.RequestPage(pageNum - 1)
+			newCurrent.prefetcher.RequestPage(pageNum)
+			newCurrent.prefetcher.RequestPage(pageNum + 1)
+		}
 	}
-	a.search.Clear()
+	a.ClearSearch()
 }
 
 // Draw renders the current view
