@@ -68,8 +68,8 @@ kubectl logs pod-name | sieve
 | `l` / `→` | Scroll right |
 | `g` / `Home` | Go to first line |
 | `G` / `End` | Go to last line |
-| `Space` / `PgDn` | Page down |
-| `PgUp` | Page up |
+| `Ctrl+D` / `Space` / `PgDn` | Page down |
+| `Ctrl+U` / `PgUp` | Page up |
 | `:<number>` | Go to line number |
 
 ### Search
@@ -89,7 +89,7 @@ kubectl logs pod-name | sieve
 | `-` | Exclude lines matching pattern |
 | `+` | Add matching lines from original |
 | `=` | Reset to original file |
-| `u` / `Ctrl+U` | Pop last filter |
+| `U` | Pop last filter |
 
 ### Display
 | Key | Action |
@@ -108,7 +108,7 @@ kubectl logs pod-name | sieve
 | `t` | Set timestamp format |
 | `b` | Jump to timestamp |
 | `H` / `F1` | Show help |
-| `q` / `Esc` | Quit |
+| `q` | Quit |
 
 ## Examples
 

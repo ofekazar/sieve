@@ -1740,8 +1740,8 @@ func (a *App) ShowHelp() {
 			{"< / >", "Scroll left/right by 1 char"},
 			{"g / Home", "Go to first line"},
 			{"G / End", "Go to last line"},
-			{"Space/PgDn", "Page down"},
-			{"PgUp", "Page up"},
+			{"Ctrl+D/Space/PgDn", "Page down"},
+			{"Ctrl+U/PgUp", "Page up"},
 			{":<number>", "Go to specific line number"},
 		}},
 		{"Search", []helpEntry{
@@ -1761,7 +1761,7 @@ func (a *App) ShowHelp() {
 			{"-", "Exclude lines matching pattern"},
 			{"+", "Add matching from original file"},
 			{"=", "Reset to original file"},
-			{"u / Ctrl+U", "Pop last filter (go back one level)"},
+			{"U", "Pop last filter (go back one level)"},
 		}},
 		{"Display", []helpEntry{
 			{"w", "Toggle word wrap"},
@@ -1773,7 +1773,7 @@ func (a *App) ShowHelp() {
 			{"v", "Enter visual selection mode"},
 			{"y", "Yank (copy) selected lines"},
 			{";", "Export filtered view to file"},
-			{"Esc", "Exit visual mode / quit"},
+			{"Esc", "Exit visual mode"},
 		}},
 		{"Help", []helpEntry{
 			{"H / F1", "Show this help screen"},
@@ -2769,9 +2769,9 @@ func (v *Viewer) run() error {
 						current.navigateUp()
 					}
 				case 'h':
-					current.navigateLeft(current.width / 4)
+					current.navigateLeft(15)
 				case 'l':
-					current.navigateRight(current.width / 4)
+					current.navigateRight(15)
 				case 'w':
 					current.wordWrap = !current.wordWrap
 					current.leftCol = 0         // Reset horizontal scroll when toggling wrap
@@ -2813,8 +2813,6 @@ func (v *Viewer) run() error {
 					app.HandleSearchNav(true)
 				case '=':
 					app.HandleStackNav(true)
-				case 'u':
-					app.HandleStackNav(false)
 				case '>':
 					current.navigateRight(1)
 				case '<':
@@ -2833,6 +2831,8 @@ func (v *Viewer) run() error {
 					app.HandleSetTimestampFormat()
 				case 'b':
 					app.HandleTimestampSearch()
+				case 'U':
+					app.HandleStackNav(false)
 				}
 			} else {
 				switch ev.Key {
@@ -2849,16 +2849,16 @@ func (v *Viewer) run() error {
 						current.navigateDown()
 					}
 				case termbox.KeyArrowLeft:
-					current.navigateLeft(current.width / 4)
+					current.navigateLeft(15)
 				case termbox.KeyArrowRight:
-					current.navigateRight(current.width / 4)
-				case termbox.KeyPgdn, termbox.KeySpace:
+					current.navigateRight(15)
+				case termbox.KeyPgdn, termbox.KeySpace, termbox.KeyCtrlD:
 					if app.visualMode {
 						app.VisualPageDown()
 					} else {
 						current.pageDown()
 					}
-				case termbox.KeyPgup:
+				case termbox.KeyPgup, termbox.KeyCtrlU:
 					if app.visualMode {
 						app.VisualPageUp()
 					} else {
@@ -2876,15 +2876,11 @@ func (v *Viewer) run() error {
 					} else {
 						current.goToEnd()
 					}
-				case termbox.KeyCtrlU:
-					app.HandleStackNav(false)
 				case termbox.KeyF1:
 					app.ShowHelp()
 				case termbox.KeyEsc:
 					if app.visualMode {
 						app.ExitVisualMode()
-					} else {
-						return nil
 					}
 				case termbox.KeyCtrlC:
 					return nil
