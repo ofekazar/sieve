@@ -2350,20 +2350,39 @@ func (a *App) HandleSearchNav(reverse bool) {
 		return
 	}
 
+	current := a.stack.Current()
+	topLine := current.topLine
+
 	// Determine if we should go forward (down) or backward (up) in the file
 	goingUp := a.search.backward != reverse
 
 	if goingUp {
-		if a.search.AtStart() {
+		// Find the last match BEFORE topLine
+		found := false
+		for i := len(a.search.matches) - 1; i >= 0; i-- {
+			if a.search.matches[i] < topLine {
+				current.topLine = a.search.matches[i]
+				a.search.current = i
+				found = true
+				break
+			}
+		}
+		if !found {
 			a.ShowTempMessage("BOF")
-		} else if lineIdx := a.search.Prev(); lineIdx >= 0 {
-			a.stack.Current().topLine = lineIdx
 		}
 	} else {
-		if a.search.AtEnd() {
+		// Find the first match AFTER topLine
+		found := false
+		for i, lineIdx := range a.search.matches {
+			if lineIdx > topLine {
+				current.topLine = lineIdx
+				a.search.current = i
+				found = true
+				break
+			}
+		}
+		if !found {
 			a.ShowTempMessage("EOF")
-		} else if lineIdx := a.search.Next(); lineIdx >= 0 {
-			a.stack.Current().topLine = lineIdx
 		}
 	}
 }
