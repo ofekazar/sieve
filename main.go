@@ -342,6 +342,7 @@ type Viewer struct {
 	filename         string       // Original filename (empty for filtered views)
 	wordWrap         bool         // Word wrap mode
 	jsonPretty       bool         // JSON pretty-print mode
+	showLineNumbers  bool         // Show line numbers on left side
 	stickyLeft       int          // Number of chars to keep visible on left when scrolling (0 = disabled)
 	topLine          int          // Index of the line at the top of the screen
 	topLineOffset    int          // Offset within expanded line (for wrap/JSON mode)
@@ -360,15 +361,17 @@ type ViewerStack struct {
 
 // App holds the application state
 type App struct {
-	stack           *ViewerStack
-	search          *SearchState
-	history         *History // Shared history for filters and searches
-	statusMessage   string
-	messageExpiry   time.Time
-	visualMode      bool   // True when in visual selection mode
-	visualStart     int    // Starting line of visual selection
-	visualCursor    int    // Current cursor line in visual mode
-	timestampFormat string // Python-style datetime format for timestamp search
+	stack              *ViewerStack
+	search             *SearchState
+	history            *History // Shared history for filters and searches
+	statusMessage      string
+	messageExpiry      time.Time
+	visualMode         bool   // True when in visual selection mode
+	visualStart        int    // Starting line of visual selection
+	visualStartOffset  int    // Row offset within starting line (for wrap/json mode)
+	visualCursor       int    // Current cursor line in visual mode
+	visualCursorOffset int    // Row offset within cursor line (for wrap/json mode)
+	timestampFormat    string // Python-style datetime format for timestamp search
 }
 
 // History manages persistent command history (for filters and searches)
@@ -594,50 +597,100 @@ func (s *SearchState) Search(lines []string, hasANSI []bool, query string, start
 	s.backward = backward
 	s.regex = nil
 
-	// Helper to get plain text (only strip if has ANSI codes)
-	getPlain := func(i int, line string) string {
-		if hasANSI != nil && i < len(hasANSI) && !hasANSI[i] {
-			return line // No ANSI codes, use as-is
-		}
-		return stripANSI(line)
+	totalLines := len(lines)
+	if totalLines == 0 {
+		return -1
 	}
 
-	// Fast path: literal case-sensitive search using strings.Contains
-	if !isRegex && !ignoreCase {
-		for i, line := range lines {
-			plainLine := getPlain(i, line)
-			if strings.Contains(plainLine, query) {
-				s.matches = append(s.matches, i)
-			}
-		}
-	} else if !isRegex && ignoreCase {
-		// Case-insensitive literal search
-		lowerQuery := strings.ToLower(query)
-		for i, line := range lines {
-			plainLine := getPlain(i, line)
-			if strings.Contains(strings.ToLower(plainLine), lowerQuery) {
-				s.matches = append(s.matches, i)
-			}
-		}
-	} else {
-		// Regex search
+	// Compile regex if needed (thread-safe for matching)
+	var re *regexp.Regexp
+	if isRegex {
 		pattern := query
 		if ignoreCase {
 			pattern = "(?i)" + pattern
 		}
-		re, err := regexp.Compile(pattern)
+		var err error
+		re, err = regexp.Compile(pattern)
 		if err != nil {
-			// Invalid regex, treat as literal
 			re = regexp.MustCompile(regexp.QuoteMeta(query))
 		}
 		s.regex = re
+	}
 
-		for i, line := range lines {
-			plainLine := getPlain(i, line)
-			if s.regex.MatchString(plainLine) {
-				s.matches = append(s.matches, i)
-			}
+	// Prepare for parallel search
+	numWorkers := 8
+	if totalLines < numWorkers {
+		numWorkers = 1
+	}
+	chunkSize := (totalLines + numWorkers - 1) / numWorkers
+
+	type searchResult struct {
+		chunkIdx int
+		matches  []int
+	}
+	resultChan := make(chan searchResult, numWorkers)
+
+	// Precompute lowercase query for case-insensitive search
+	lowerQuery := ""
+	if !isRegex && ignoreCase {
+		lowerQuery = strings.ToLower(query)
+	}
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > totalLines {
+			end = totalLines
 		}
+		if start >= totalLines {
+			break
+		}
+
+		go func(chunkIdx, start, end int) {
+			var chunkMatches []int
+			for i := start; i < end; i++ {
+				line := lines[i]
+				// Get plain text (only strip if has ANSI codes)
+				var plainLine string
+				if hasANSI != nil && i < len(hasANSI) && !hasANSI[i] {
+					plainLine = line
+				} else {
+					plainLine = stripANSI(line)
+				}
+
+				var matches bool
+				if !isRegex && !ignoreCase {
+					matches = strings.Contains(plainLine, query)
+				} else if !isRegex && ignoreCase {
+					matches = strings.Contains(strings.ToLower(plainLine), lowerQuery)
+				} else {
+					matches = re.MatchString(plainLine)
+				}
+
+				if matches {
+					chunkMatches = append(chunkMatches, i)
+				}
+			}
+			resultChan <- searchResult{chunkIdx, chunkMatches}
+		}(w, start, end)
+	}
+
+	// Collect results in order
+	results := make([]searchResult, numWorkers)
+	expectedWorkers := numWorkers
+	if totalLines < numWorkers {
+		expectedWorkers = 1
+	}
+	for i := 0; i < expectedWorkers; i++ {
+		result := <-resultChan
+		results[result.chunkIdx] = result
+	}
+	close(resultChan)
+
+	// Merge results in order (maintains sorted line indices)
+	for chunkIdx := 0; chunkIdx < numWorkers; chunkIdx++ {
+		s.matches = append(s.matches, results[chunkIdx].matches...)
 	}
 
 	if len(s.matches) == 0 {
@@ -934,6 +987,9 @@ func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) 
 	if v.jsonPretty {
 		modeStr += " [json]"
 	}
+	if v.showLineNumbers {
+		modeStr += " [ln]"
+	}
 	if v.stickyLeft > 0 {
 		modeStr += fmt.Sprintf(" [K:%d]", v.stickyLeft)
 	}
@@ -1008,6 +1064,65 @@ func (a *App) drawVisualStatusBar(v *Viewer, status string) {
 	}
 }
 
+// drawStatusBarWithSearch draws the status bar including search info
+func (a *App) drawStatusBarWithSearch(v *Viewer, depth int, origLine int, origTotal int, searchInfo string) {
+	statusY := v.height
+	lineCount := v.LineCount()
+	loadingStr := ""
+	if v.IsLoading() {
+		loadingStr = " [loading...]"
+	}
+	modeStr := ""
+	if v.follow {
+		modeStr += " [follow]"
+	}
+	if v.wordWrap {
+		modeStr += " [wrap]"
+	}
+	if v.jsonPretty {
+		modeStr += " [json]"
+	}
+	if v.showLineNumbers {
+		modeStr += " [ln]"
+	}
+	if v.stickyLeft > 0 {
+		modeStr += fmt.Sprintf(" [K:%d]", v.stickyLeft)
+	}
+
+	var status string
+	if depth > 1 {
+		status = fmt.Sprintf(" Line %d/%d | Original %d/%d%s | Col %d%s%s | Depth %d | q:quit ",
+			v.topLine+1, lineCount, origLine+1, origTotal, searchInfo, v.leftCol, modeStr, loadingStr, depth)
+	} else {
+		status = fmt.Sprintf(" Line %d/%d%s | Col %d%s%s | Depth %d | q:quit ",
+			v.topLine+1, lineCount, searchInfo, v.leftCol, modeStr, loadingStr, depth)
+	}
+
+	// Clear the status line first
+	for i := 0; i < v.width; i++ {
+		termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+	}
+
+	// Draw left-aligned status
+	for i, char := range status {
+		if i >= v.width {
+			break
+		}
+		termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+	}
+
+	// Draw right-aligned filename
+	if v.filename != "" {
+		filenameDisplay := " " + v.filename + " "
+		startX := v.width - len([]rune(filenameDisplay))
+		if startX > len(status) {
+			for i, char := range filenameDisplay {
+				termbox.SetCell(startX+i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+			}
+		}
+	}
+}
+
 // getExpandedLineCount returns how many screen rows a line expands to
 func (v *Viewer) getExpandedLineCount(lineIdx int) int {
 	if lineIdx < 0 || lineIdx >= v.LineCount() {
@@ -1017,8 +1132,10 @@ func (v *Viewer) getExpandedLineCount(lineIdx int) int {
 		return 1 // Safety: avoid division by zero
 	}
 
-	// Build cache key based on current mode and width
-	cacheKey := fmt.Sprintf("%v:%v:%d", v.wordWrap, v.jsonPretty, v.width)
+	// Build cache key based on current mode, width, and line numbers (affects wrap width)
+	lineNumWidth := v.getLineNumWidth()
+	effectiveWidth := v.width - lineNumWidth
+	cacheKey := fmt.Sprintf("%v:%v:%d", v.wordWrap, v.jsonPretty, effectiveWidth)
 	if v.expandedCacheKey != cacheKey {
 		// Mode or width changed, invalidate cache
 		v.expandedCache = make(map[int]int)
@@ -1049,13 +1166,17 @@ func (v *Viewer) getExpandedLineCount(lineIdx int) int {
 	if !v.wordWrap {
 		totalRows = len(lines)
 	} else {
-		// Count wrapped rows for each line
+		// Count wrapped rows for each line (using effective width accounting for line numbers)
+		wrapWidth := effectiveWidth
+		if wrapWidth <= 0 {
+			wrapWidth = 1
+		}
 		for _, l := range lines {
 			cells := parseANSI(l)
 			if len(cells) == 0 {
 				totalRows++
 			} else {
-				totalRows += (len(cells) + v.width - 1) / v.width
+				totalRows += (len(cells) + wrapWidth - 1) / wrapWidth
 			}
 		}
 	}
@@ -1472,26 +1593,43 @@ func (a *App) EnterVisualMode() {
 	current := a.stack.Current()
 	a.visualMode = true
 	a.visualStart = current.topLine
+	a.visualStartOffset = current.topLineOffset
 	a.visualCursor = current.topLine
+	a.visualCursorOffset = current.topLineOffset
 }
 
 // ExitVisualMode exits visual mode without action
 func (a *App) ExitVisualMode() {
 	a.visualMode = false
 	a.visualStart = 0
+	a.visualStartOffset = 0
 	a.visualCursor = 0
+	a.visualCursorOffset = 0
 }
 
 // VisualCursorDown moves cursor down in visual mode, scrolling if needed
 func (a *App) VisualCursorDown() {
 	current := a.stack.Current()
 	lineCount := current.LineCount()
-	
-	if a.visualCursor < lineCount-1 {
-		a.visualCursor++
+
+	if current.wordWrap || current.jsonPretty {
+		// Row-by-row movement in wrap/json mode
+		expandedCount := current.getExpandedLineCount(a.visualCursor)
+		if a.visualCursorOffset < expandedCount-1 {
+			a.visualCursorOffset++
+		} else if a.visualCursor < lineCount-1 {
+			a.visualCursor++
+			a.visualCursorOffset = 0
+		}
 		// Scroll if cursor goes below visible area
-		if a.visualCursor >= current.topLine+current.height {
-			current.topLine++
+		a.visualScrollIfNeeded()
+	} else {
+		if a.visualCursor < lineCount-1 {
+			a.visualCursor++
+			// Scroll if cursor goes below visible area
+			if a.visualCursor >= current.topLine+current.height {
+				current.topLine++
+			}
 		}
 	}
 }
@@ -1499,12 +1637,78 @@ func (a *App) VisualCursorDown() {
 // VisualCursorUp moves cursor up in visual mode, scrolling if needed
 func (a *App) VisualCursorUp() {
 	current := a.stack.Current()
-	
-	if a.visualCursor > 0 {
-		a.visualCursor--
+
+	if current.wordWrap || current.jsonPretty {
+		// Row-by-row movement in wrap/json mode
+		if a.visualCursorOffset > 0 {
+			a.visualCursorOffset--
+		} else if a.visualCursor > 0 {
+			a.visualCursor--
+			a.visualCursorOffset = current.getExpandedLineCount(a.visualCursor) - 1
+		}
 		// Scroll if cursor goes above visible area
-		if a.visualCursor < current.topLine {
-			current.topLine--
+		a.visualScrollIfNeeded()
+	} else {
+		if a.visualCursor > 0 {
+			a.visualCursor--
+			// Scroll if cursor goes above visible area
+			if a.visualCursor < current.topLine {
+				current.topLine--
+			}
+		}
+	}
+}
+
+// visualScrollIfNeeded scrolls the view to keep visual cursor visible (for wrap/json mode)
+func (a *App) visualScrollIfNeeded() {
+	current := a.stack.Current()
+
+	// Calculate screen row of cursor relative to topLine
+	cursorScreenRow := 0
+	if a.visualCursor > current.topLine {
+		for i := current.topLine; i < a.visualCursor; i++ {
+			cursorScreenRow += current.getExpandedLineCount(i)
+		}
+		cursorScreenRow -= current.topLineOffset
+		cursorScreenRow += a.visualCursorOffset
+	} else if a.visualCursor == current.topLine {
+		cursorScreenRow = a.visualCursorOffset - current.topLineOffset
+	} else {
+		// Cursor is above topLine, need to scroll up
+		cursorScreenRow = -1
+	}
+
+	// Scroll down if cursor below visible area
+	for cursorScreenRow >= current.height {
+		current.navigateDown()
+		// Recalculate
+		cursorScreenRow = 0
+		if a.visualCursor > current.topLine {
+			for i := current.topLine; i < a.visualCursor; i++ {
+				cursorScreenRow += current.getExpandedLineCount(i)
+			}
+			cursorScreenRow -= current.topLineOffset
+			cursorScreenRow += a.visualCursorOffset
+		} else if a.visualCursor == current.topLine {
+			cursorScreenRow = a.visualCursorOffset - current.topLineOffset
+		}
+	}
+
+	// Scroll up if cursor above visible area
+	for cursorScreenRow < 0 {
+		current.navigateUp()
+		// Recalculate
+		if a.visualCursor > current.topLine {
+			cursorScreenRow = 0
+			for i := current.topLine; i < a.visualCursor; i++ {
+				cursorScreenRow += current.getExpandedLineCount(i)
+			}
+			cursorScreenRow -= current.topLineOffset
+			cursorScreenRow += a.visualCursorOffset
+		} else if a.visualCursor == current.topLine {
+			cursorScreenRow = a.visualCursorOffset - current.topLineOffset
+		} else {
+			cursorScreenRow = -1
 		}
 	}
 }
@@ -1513,16 +1717,23 @@ func (a *App) VisualCursorUp() {
 func (a *App) VisualPageDown() {
 	current := a.stack.Current()
 	lineCount := current.LineCount()
-	
-	a.visualCursor += current.height
-	if a.visualCursor >= lineCount {
-		a.visualCursor = lineCount - 1
-	}
-	// Scroll to keep cursor visible
-	if a.visualCursor >= current.topLine+current.height {
-		current.topLine = a.visualCursor - current.height + 1
-		if current.topLine < 0 {
-			current.topLine = 0
+
+	if current.wordWrap || current.jsonPretty {
+		// Move by screen height rows
+		for i := 0; i < current.height; i++ {
+			a.VisualCursorDown()
+		}
+	} else {
+		a.visualCursor += current.height
+		if a.visualCursor >= lineCount {
+			a.visualCursor = lineCount - 1
+		}
+		// Scroll to keep cursor visible
+		if a.visualCursor >= current.topLine+current.height {
+			current.topLine = a.visualCursor - current.height + 1
+			if current.topLine < 0 {
+				current.topLine = 0
+			}
 		}
 	}
 }
@@ -1530,14 +1741,21 @@ func (a *App) VisualPageDown() {
 // VisualPageUp moves cursor up by a page in visual mode
 func (a *App) VisualPageUp() {
 	current := a.stack.Current()
-	
-	a.visualCursor -= current.height
-	if a.visualCursor < 0 {
-		a.visualCursor = 0
-	}
-	// Scroll to keep cursor visible
-	if a.visualCursor < current.topLine {
-		current.topLine = a.visualCursor
+
+	if current.wordWrap || current.jsonPretty {
+		// Move by screen height rows
+		for i := 0; i < current.height; i++ {
+			a.VisualCursorUp()
+		}
+	} else {
+		a.visualCursor -= current.height
+		if a.visualCursor < 0 {
+			a.visualCursor = 0
+		}
+		// Scroll to keep cursor visible
+		if a.visualCursor < current.topLine {
+			current.topLine = a.visualCursor
+		}
 	}
 }
 
@@ -1545,7 +1763,9 @@ func (a *App) VisualPageUp() {
 func (a *App) VisualGoToStart() {
 	current := a.stack.Current()
 	a.visualCursor = 0
+	a.visualCursorOffset = 0
 	current.topLine = 0
+	current.topLineOffset = 0
 }
 
 // VisualGoToEnd moves cursor to end of file in visual mode
@@ -1553,13 +1773,13 @@ func (a *App) VisualGoToEnd() {
 	current := a.stack.Current()
 	lineCount := current.LineCount()
 	a.visualCursor = lineCount - 1
-	// Scroll to show cursor
-	if a.visualCursor >= current.topLine+current.height {
-		current.topLine = a.visualCursor - current.height + 1
-		if current.topLine < 0 {
-			current.topLine = 0
-		}
+	if current.wordWrap || current.jsonPretty {
+		a.visualCursorOffset = current.getExpandedLineCount(a.visualCursor) - 1
+	} else {
+		a.visualCursorOffset = 0
 	}
+	// Scroll to show cursor
+	a.visualScrollIfNeeded()
 }
 
 // YankVisualSelection copies selected lines to clipboard
@@ -1569,18 +1789,99 @@ func (a *App) YankVisualSelection() {
 	}
 
 	current := a.stack.Current()
-	startLine := a.visualStart
-	endLine := a.visualCursor
 
-	// Ensure start <= end
-	if startLine > endLine {
-		startLine, endLine = endLine, startLine
-	}
-
-	// Collect lines (strip ANSI codes for clean copy)
 	var lines []string
-	for i := startLine; i <= endLine; i++ {
-		lines = append(lines, stripANSI(current.GetLine(i)))
+	var rowCount int
+
+	if current.wordWrap || current.jsonPretty {
+		// Row-by-row yank in wrap/JSON mode
+		startLine := a.visualStart
+		startOff := a.visualStartOffset
+		endLine := a.visualCursor
+		endOff := a.visualCursorOffset
+
+		// Ensure start <= end
+		if startLine > endLine || (startLine == endLine && startOff > endOff) {
+			startLine, endLine = endLine, startLine
+			startOff, endOff = endOff, startOff
+		}
+
+		wrapWidth := current.width - current.getLineNumWidth()
+		if wrapWidth <= 0 {
+			wrapWidth = current.width
+		}
+
+		// Iterate through lines and collect selected rows
+		for lineIdx := startLine; lineIdx <= endLine; lineIdx++ {
+			line := current.GetLine(lineIdx)
+
+			// Expand the line (JSON or wrap)
+			var expandedRows []string
+			if current.jsonPretty && isJSON(line) {
+				expandedRows = formatJSON(line)
+			} else {
+				expandedRows = []string{line}
+			}
+
+			// If word wrap is enabled, further split each expanded row
+			var allRows []string
+			if current.wordWrap {
+				for _, row := range expandedRows {
+					cells := parseANSI(row)
+					if len(cells) == 0 {
+						allRows = append(allRows, "")
+					} else {
+						// Split into wrapped rows
+						for i := 0; i < len(cells); i += wrapWidth {
+							end := i + wrapWidth
+							if end > len(cells) {
+								end = len(cells)
+							}
+							var rowChars []rune
+							for j := i; j < end; j++ {
+								rowChars = append(rowChars, cells[j].char)
+							}
+							allRows = append(allRows, string(rowChars))
+						}
+					}
+				}
+			} else {
+				// JSON mode without wrap - each JSON line is a row
+				for _, row := range expandedRows {
+					allRows = append(allRows, stripANSI(row))
+				}
+			}
+
+			// Determine which rows to include from this line
+			rowStart := 0
+			rowEnd := len(allRows) - 1
+
+			if lineIdx == startLine {
+				rowStart = startOff
+			}
+			if lineIdx == endLine {
+				rowEnd = endOff
+			}
+
+			// Collect the selected rows
+			for rowIdx := rowStart; rowIdx <= rowEnd && rowIdx < len(allRows); rowIdx++ {
+				lines = append(lines, allRows[rowIdx])
+				rowCount++
+			}
+		}
+	} else {
+		// Normal mode - yank entire logical lines
+		startLine := a.visualStart
+		endLine := a.visualCursor
+
+		if startLine > endLine {
+			startLine, endLine = endLine, startLine
+		}
+
+		for i := startLine; i <= endLine; i++ {
+			lines = append(lines, stripANSI(current.GetLine(i)))
+		}
+		rowCount = len(lines)
 	}
 
 	text := strings.Join(lines, "\n")
@@ -1588,13 +1889,14 @@ func (a *App) YankVisualSelection() {
 
 	a.visualMode = false
 	a.visualStart = 0
+	a.visualStartOffset = 0
 	a.visualCursor = 0
+	a.visualCursorOffset = 0
 
 	if err != nil {
 		a.ShowTempMessage("Clipboard error: " + err.Error())
 	} else {
-		count := endLine - startLine + 1
-		a.ShowTempMessage(fmt.Sprintf("Yanked %d line(s)", count))
+		a.ShowTempMessage(fmt.Sprintf("Yanked %d row(s)", rowCount))
 	}
 }
 
@@ -1820,6 +2122,7 @@ func (a *App) ShowHelp() {
 			{"f", "Toggle JSON pretty-print"},
 			{"F", "Toggle follow mode (tail -f)"},
 			{"K", "Set sticky left columns"},
+			{"L", "Toggle line numbers"},
 		}},
 		{"Selection & Export", []helpEntry{
 			{"v", "Enter visual selection mode"},
@@ -2532,7 +2835,7 @@ func (a *App) Draw() {
 
 	lineCount := current.LineCount()
 
-	if current.wordWrap {
+	if current.wordWrap || current.jsonPretty {
 		a.drawWrapped(current, lineCount)
 	} else {
 		a.drawNormal(current, lineCount)
@@ -2562,12 +2865,33 @@ func (a *App) Draw() {
 			}
 		}
 		origTotal := a.stack.viewers[0].LineCount()
-		current.drawStatusBarWithDepth(len(a.stack.viewers), origLine, origTotal)
+		
+		// Add search info if there are results
+		searchInfo := ""
+		if a.search.HasResults() {
+			searchInfo = fmt.Sprintf(" | Search: %d/%d", a.search.current+1, len(a.search.matches))
+		}
+		a.drawStatusBarWithSearch(current, len(a.stack.viewers), origLine, origTotal, searchInfo)
 		termbox.Flush()
 	}
 }
 
 // drawNormal renders without word wrap
+// getLineNumWidth returns the width needed for line numbers
+func (v *Viewer) getLineNumWidth() int {
+	if !v.showLineNumbers {
+		return 0
+	}
+	// Calculate digits needed for max line number
+	maxLine := v.LineCount()
+	digits := 1
+	for maxLine >= 10 {
+		maxLine /= 10
+		digits++
+	}
+	return digits + 1 // +1 for separator space
+}
+
 func (a *App) drawNormal(current *Viewer, lineCount int) {
 	screenY := 0
 	lineIndex := current.topLine
@@ -2575,6 +2899,10 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 
 	// Pastel blue color (using 256-color mode: color 117 is a light blue)
 	stickyFg := termbox.Attribute(117 + 1) // +1 because termbox uses 1-indexed colors
+
+	// Line number width (0 if disabled)
+	lineNumWidth := current.getLineNumWidth()
+	lineNumFg := termbox.Attribute(244) // Gray color for line numbers
 
 	// Calculate effective sticky columns
 	stickyActive := current.stickyLeft > 0
@@ -2607,9 +2935,11 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 			linesToRender = []string{line}
 		}
 
+		isFirstRow := true
 		for _, renderLine := range linesToRender {
 			if skipRows > 0 {
 				skipRows--
+				isFirstRow = false
 				continue
 			}
 			if screenY >= current.height {
@@ -2620,6 +2950,24 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 			matchPositions := a.getMatchPositions(cells)
 
 			screenX := 0
+
+			// Draw line number (only on first row of logical line)
+			if lineNumWidth > 0 {
+				if isFirstRow {
+					lineNumStr := fmt.Sprintf("%*d ", lineNumWidth-1, lineIndex+1)
+					for _, ch := range lineNumStr {
+						termbox.SetCell(screenX, screenY, ch, lineNumFg, termbox.ColorDefault)
+						screenX++
+					}
+				} else {
+					// Fill with spaces for continuation rows
+					for i := 0; i < lineNumWidth; i++ {
+						termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, termbox.ColorDefault)
+						screenX++
+					}
+				}
+			}
+			isFirstRow = false
 
 			// Visual selection background color
 			visualBg := termbox.Attribute(239) // Dark gray for selection
@@ -2711,6 +3059,26 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 	screenY := 0
 	lineIndex := current.topLine
 	skipRows := current.topLineOffset // Skip this many rows at start
+	rowInLine := 0                    // Current row within the logical line
+
+	// Line number width (0 if disabled)
+	lineNumWidth := current.getLineNumWidth()
+	lineNumFg := termbox.Attribute(244) // Gray color for line numbers
+	wrapWidth := current.width - lineNumWidth
+
+	// Visual selection range (line and offset)
+	var visualStartLine, visualStartOff, visualEndLine, visualEndOff int
+	if a.visualMode {
+		visualStartLine = a.visualStart
+		visualStartOff = a.visualStartOffset
+		visualEndLine = a.visualCursor
+		visualEndOff = a.visualCursorOffset
+		// Ensure start <= end
+		if visualStartLine > visualEndLine || (visualStartLine == visualEndLine && visualStartOff > visualEndOff) {
+			visualStartLine, visualEndLine = visualEndLine, visualStartLine
+			visualStartOff, visualEndOff = visualEndOff, visualStartOff
+		}
+	}
 
 	for screenY < current.height && lineIndex < lineCount {
 		line := current.GetLine(lineIndex)
@@ -2723,6 +3091,8 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 			linesToRender = []string{line}
 		}
 
+		rowInLine = 0
+		isFirstRowOfLine := true
 		for _, renderLine := range linesToRender {
 			cells := parseANSI(renderLine)
 			matchPositions := a.getMatchPositions(cells)
@@ -2731,9 +3101,37 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 				// Empty line
 				if skipRows > 0 {
 					skipRows--
+					isFirstRowOfLine = false
 				} else if screenY < current.height {
+					screenX := 0
+					// Draw line number on first row
+					if lineNumWidth > 0 {
+						if isFirstRowOfLine {
+							lineNumStr := fmt.Sprintf("%*d ", lineNumWidth-1, lineIndex+1)
+							for _, ch := range lineNumStr {
+								termbox.SetCell(screenX, screenY, ch, lineNumFg, termbox.ColorDefault)
+								screenX++
+							}
+						} else {
+							for i := 0; i < lineNumWidth; i++ {
+								termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, termbox.ColorDefault)
+								screenX++
+							}
+						}
+					}
+					isFirstRowOfLine = false
+					// Check if this row is in visual selection
+					inVisual := a.visualMode && a.isRowInVisualSelection(lineIndex, rowInLine, visualStartLine, visualStartOff, visualEndLine, visualEndOff)
+					if inVisual {
+						// Highlight empty row
+						for screenX < current.width {
+							termbox.SetCell(screenX, screenY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+							screenX++
+						}
+					}
 					screenY++
 				}
+				rowInLine++
 				continue
 			}
 
@@ -2744,30 +3142,84 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 					// Skip this wrapped row
 					skipRows--
 					// Advance cellIdx by one row's worth
-					cellIdx += current.width
+					cellIdx += wrapWidth
+					rowInLine++
+					isFirstRowOfLine = false
 					continue
 				}
 				if screenY >= current.height {
 					break
 				}
 
+				// Check if this row is in visual selection
+				inVisual := a.visualMode && a.isRowInVisualSelection(lineIndex, rowInLine, visualStartLine, visualStartOff, visualEndLine, visualEndOff)
+
 				screenX := 0
+
+				// Draw line number on first row of logical line
+				if lineNumWidth > 0 {
+					if isFirstRowOfLine {
+						lineNumStr := fmt.Sprintf("%*d ", lineNumWidth-1, lineIndex+1)
+						for _, ch := range lineNumStr {
+							termbox.SetCell(screenX, screenY, ch, lineNumFg, termbox.ColorDefault)
+							screenX++
+						}
+					} else {
+						for i := 0; i < lineNumWidth; i++ {
+							termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, termbox.ColorDefault)
+							screenX++
+						}
+					}
+				}
+				isFirstRowOfLine = false
+
 				for screenX < current.width && cellIdx < len(cells) {
 					cell := cells[cellIdx]
 					fg, bg := cell.fg, cell.bg
 					if matchPositions != nil && cellIdx < len(matchPositions) && matchPositions[cellIdx] {
 						fg = termbox.ColorBlack
 						bg = termbox.ColorYellow
+					} else if inVisual {
+						fg = termbox.ColorBlack
+						bg = termbox.ColorWhite
 					}
 					termbox.SetCell(screenX, screenY, cell.char, fg, bg)
 					screenX++
 					cellIdx++
 				}
+				// Fill remaining with visual highlight if needed
+				if inVisual {
+					for screenX < current.width {
+						termbox.SetCell(screenX, screenY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+						screenX++
+					}
+				}
 				screenY++
+				rowInLine++
 			}
 		}
 		lineIndex++
 	}
+}
+
+// isRowInVisualSelection checks if a specific row (line + offset) is within visual selection
+func (a *App) isRowInVisualSelection(line, rowOffset, startLine, startOff, endLine, endOff int) bool {
+	if line < startLine || line > endLine {
+		return false
+	}
+	if line > startLine && line < endLine {
+		return true
+	}
+	if startLine == endLine {
+		return rowOffset >= startOff && rowOffset <= endOff
+	}
+	if line == startLine {
+		return rowOffset >= startOff
+	}
+	if line == endLine {
+		return rowOffset <= endOff
+	}
+	return false
 }
 
 // getMatchPositions returns search match positions for highlighting
@@ -2925,9 +3377,11 @@ func (v *Viewer) run() error {
 					current.navigateRight(1)
 				case '<':
 					current.navigateLeft(1)
-				case 'K':
-					app.HandleStickyLeft()
-				case 'v':
+			case 'K':
+				app.HandleStickyLeft()
+			case 'L':
+				current.showLineNumbers = !current.showLineNumbers
+			case 'v':
 					if !app.visualMode {
 						app.EnterVisualMode()
 					}
@@ -3187,6 +3641,7 @@ func main() {
 	// Parse command line flags
 	followFlag := flag.Bool("f", false, "Follow mode (like tail -f)")
 	followLongFlag := flag.Bool("follow", false, "Follow mode (like tail -f)")
+	lineNumFlag := flag.Bool("l", false, "Show line numbers")
 	helpFlag := flag.Bool("h", false, "Show help")
 	helpLongFlag := flag.Bool("help", false, "Show help")
 	versionFlag := flag.Bool("version", false, "Show version")
@@ -3197,6 +3652,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       command | sieve\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  -f, --follow    Follow mode (like tail -f)\n")
+		fmt.Fprintf(os.Stderr, "  -l              Show line numbers\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help      Show this help message\n")
 		fmt.Fprintf(os.Stderr, "      --version   Show version\n\n")
 		fmt.Fprintf(os.Stderr, "Press 'H' or F1 while running for keybinding help.\n")
@@ -3244,8 +3700,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set follow mode
+	// Set follow mode and line numbers
 	viewer.follow = follow
+	viewer.showLineNumbers = *lineNumFlag
 
 	if err := viewer.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

@@ -98,6 +98,7 @@ kubectl logs pod-name | sieve
 | `f` | Toggle JSON pretty-print |
 | `F` | Toggle follow mode |
 | `K` | Set sticky left columns |
+| `L` | Toggle line numbers |
 
 ### Other
 | Key | Action |
@@ -140,6 +141,7 @@ sieve frontend.log backend.log database.log
 
 ```
 -f, --follow    Follow mode (like tail -f)
+-l              Show line numbers
 -h, --help      Show help message
     --version   Show version
 ```
