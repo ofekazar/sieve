@@ -1533,10 +1533,10 @@ func (a *App) YankVisualSelection() {
 		startLine, endLine = endLine, startLine
 	}
 
-	// Collect lines
+	// Collect lines (strip ANSI codes for clean copy)
 	var lines []string
 	for i := startLine; i <= endLine; i++ {
-		lines = append(lines, current.GetLine(i))
+		lines = append(lines, stripANSI(current.GetLine(i)))
 	}
 
 	text := strings.Join(lines, "\n")
