@@ -1740,8 +1740,8 @@ func (a *App) ShowHelp() {
 			{"< / >", "Scroll left/right by 1 char"},
 			{"g / Home", "Go to first line"},
 			{"G / End", "Go to last line"},
-			{"Space/PgDn", "Page down"},
-			{"PgUp", "Page up"},
+			{"Ctrl+D/Space/PgDn", "Page down"},
+			{"Ctrl+U/PgUp", "Page up"},
 			{":<number>", "Go to specific line number"},
 		}},
 		{"Search", []helpEntry{
@@ -1761,7 +1761,7 @@ func (a *App) ShowHelp() {
 			{"-", "Exclude lines matching pattern"},
 			{"+", "Add matching from original file"},
 			{"=", "Reset to original file"},
-			{"u / Ctrl+U", "Pop last filter (go back one level)"},
+			{"U", "Pop last filter (go back one level)"},
 		}},
 		{"Display", []helpEntry{
 			{"w", "Toggle word wrap"},
@@ -1773,7 +1773,7 @@ func (a *App) ShowHelp() {
 			{"v", "Enter visual selection mode"},
 			{"y", "Yank (copy) selected lines"},
 			{";", "Export filtered view to file"},
-			{"Esc", "Exit visual mode / quit"},
+			{"Esc", "Exit visual mode"},
 		}},
 		{"Help", []helpEntry{
 			{"H / F1", "Show this help screen"},
