@@ -1012,13 +1012,19 @@ func (v *Viewer) drawStatusBarWithDepth(depth int, origLine int, origTotal int) 
 	}
 	modeStr := v.buildModeStr()
 
+	// Display column relative to sticky area
+	displayCol := v.leftCol - v.stickyLeft
+	if displayCol < 0 {
+		displayCol = 0
+	}
+
 	var status string
 	if depth > 1 {
 		status = fmt.Sprintf(" Line %d/%d | Original %d/%d | Col %d%s%s | Depth %d | q:quit ",
-			v.topLine+1, lineCount, origLine+1, origTotal, v.leftCol, modeStr, loadingStr, depth)
+			v.topLine+1, lineCount, origLine+1, origTotal, displayCol, modeStr, loadingStr, depth)
 	} else {
 		status = fmt.Sprintf(" Line %d/%d | Col %d%s%s | Depth %d | q:quit ",
-			v.topLine+1, lineCount, v.leftCol, modeStr, loadingStr, depth)
+			v.topLine+1, lineCount, displayCol, modeStr, loadingStr, depth)
 	}
 
 	drawStatusText(v.width, v.height, status)
@@ -1055,13 +1061,19 @@ func (a *App) drawStatusBarWithSearch(v *Viewer, depth int, origLine int, origTo
 	}
 	modeStr := v.buildModeStr()
 
+	// Display column relative to sticky area
+	displayCol := v.leftCol - v.stickyLeft
+	if displayCol < 0 {
+		displayCol = 0
+	}
+
 	var status string
 	if depth > 1 {
 		status = fmt.Sprintf(" Line %d/%d | Original %d/%d%s | Col %d%s%s | Depth %d | q:quit ",
-			v.topLine+1, lineCount, origLine+1, origTotal, searchInfo, v.leftCol, modeStr, loadingStr, depth)
+			v.topLine+1, lineCount, origLine+1, origTotal, searchInfo, displayCol, modeStr, loadingStr, depth)
 	} else {
 		status = fmt.Sprintf(" Line %d/%d%s | Col %d%s%s | Depth %d | q:quit ",
-			v.topLine+1, lineCount, searchInfo, v.leftCol, modeStr, loadingStr, depth)
+			v.topLine+1, lineCount, searchInfo, displayCol, modeStr, loadingStr, depth)
 	}
 
 	drawStatusText(v.width, v.height, status)
@@ -1183,13 +1195,22 @@ func (v *Viewer) navigateDown() {
 
 func (v *Viewer) navigateLeft(amount int) {
 	newValue := v.leftCol - amount
-	if newValue < 0 {
-		newValue = 0
+	// When sticky columns are active, minimum leftCol is stickyLeft
+	minCol := 0
+	if v.stickyLeft > 0 {
+		minCol = v.stickyLeft
+	}
+	if newValue < minCol {
+		newValue = minCol
 	}
 	v.leftCol = newValue
 }
 
 func (v *Viewer) navigateRight(amount int) {
+	// When sticky columns are active, ensure we start at stickyLeft
+	if v.stickyLeft > 0 && v.leftCol < v.stickyLeft {
+		v.leftCol = v.stickyLeft
+	}
 	v.leftCol += amount
 }
 
@@ -2470,8 +2491,16 @@ func (a *App) HandleStickyLeft() {
 	if !ok {
 		return
 	}
+	
+	oldK := current.stickyLeft
+	
 	if input == "" {
 		// Empty input disables the feature
+		// Adjust leftCol: move left by oldK amount
+		current.leftCol -= oldK
+		if current.leftCol < 0 {
+			current.leftCol = 0
+		}
 		current.stickyLeft = 0
 		a.ShowTempMessage("Sticky left disabled")
 		return
@@ -2481,8 +2510,16 @@ func (a *App) HandleStickyLeft() {
 		a.ShowTempMessage("Invalid number")
 		return
 	}
+	
+	// Adjust leftCol to keep same content visible: move by (newK - oldK)
+	current.leftCol += (num - oldK)
+	
 	current.stickyLeft = num
 	if num > 0 {
+		// Ensure leftCol is at least stickyLeft to avoid duplicate text
+		if current.leftCol < num {
+			current.leftCol = num
+		}
 		a.ShowTempMessage(fmt.Sprintf("Sticky left: %d chars", num))
 	} else {
 		a.ShowTempMessage("Sticky left disabled")

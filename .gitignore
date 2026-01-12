@@ -1,5 +1,5 @@
 *.exe
 *.log
 *.txt
-sieve
+sieve*
 TODO
