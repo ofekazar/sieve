@@ -636,7 +636,8 @@ func (s *SearchState) Search(lines []string, hasANSI []bool, query string, start
 		lowerQuery = strings.ToLower(query)
 	}
 
-	// Start workers
+	// Start workers and count how many are actually started
+	workersStarted := 0
 	for w := 0; w < numWorkers; w++ {
 		start := w * chunkSize
 		end := start + chunkSize
@@ -647,6 +648,7 @@ func (s *SearchState) Search(lines []string, hasANSI []bool, query string, start
 			break
 		}
 
+		workersStarted++
 		go func(chunkIdx, start, end int) {
 			var chunkMatches []int
 			for i := start; i < end; i++ {
@@ -676,13 +678,9 @@ func (s *SearchState) Search(lines []string, hasANSI []bool, query string, start
 		}(w, start, end)
 	}
 
-	// Collect results in order
+	// Collect results - only wait for workers that were actually started
 	results := make([]searchResult, numWorkers)
-	expectedWorkers := numWorkers
-	if totalLines < numWorkers {
-		expectedWorkers = 1
-	}
-	for i := 0; i < expectedWorkers; i++ {
+	for i := 0; i < workersStarted; i++ {
 		result := <-resultChan
 		results[result.chunkIdx] = result
 	}
@@ -2206,7 +2204,8 @@ func (a *App) HandleFilter(keep bool) {
 
 			resultChan := make(chan filterChunkResult, numWorkers)
 
-			// Start workers
+			// Start workers and count how many are actually started
+			workersStarted := 0
 			for w := 0; w < numWorkers; w++ {
 				start := w * chunkSize
 				end := start + chunkSize
@@ -2217,6 +2216,7 @@ func (a *App) HandleFilter(keep bool) {
 					break
 				}
 
+				workersStarted++
 				go func(chunkIdx, start, end int) {
 					var chunkLines []string
 					var chunkHasANSI []bool
@@ -2234,26 +2234,13 @@ func (a *App) HandleFilter(keep bool) {
 				}(w, start, end)
 			}
 
-			// Collect results in order
+			// Collect results - only wait for workers that were actually started
 			results := make([]filterChunkResult, numWorkers)
-			received := 0
-			expectedWorkers := numWorkers
-			if totalLines < numWorkers {
-				expectedWorkers = 1
-			}
-			for i := 0; i < expectedWorkers && received < numWorkers; i++ {
+			for i := 0; i < workersStarted; i++ {
 				result := <-resultChan
 				results[result.chunkIdx] = result
-				received++
-				if result.chunkIdx >= expectedWorkers {
-					break
-				}
 			}
 			close(resultChan)
-
-			// Drain any remaining
-			for range resultChan {
-			}
 
 			// Merge results in order and stream to viewer
 			foundMatch := false
@@ -2368,6 +2355,7 @@ func (a *App) HandleFilterAppend() {
 			}
 
 			// Start workers - each checks if line is in current OR matches query
+			workersStarted := 0
 			for w := 0; w < numWorkers; w++ {
 				start := w * chunkSize
 				end := start + chunkSize
@@ -2378,6 +2366,7 @@ func (a *App) HandleFilterAppend() {
 					break
 				}
 
+				workersStarted++
 				go func(chunkIdx, start, end int) {
 					var chunkLines []string
 					var chunkHasANSI []bool
@@ -2394,13 +2383,9 @@ func (a *App) HandleFilterAppend() {
 				}(w, start, end)
 			}
 
-			// Collect results in order
+			// Collect results - only wait for workers that were actually started
 			results := make([]appendChunkResult, numWorkers)
-			expectedWorkers := numWorkers
-			if totalLines < numWorkers {
-				expectedWorkers = 1
-			}
-			for i := 0; i < expectedWorkers; i++ {
+			for i := 0; i < workersStarted; i++ {
 				result := <-resultChan
 				results[result.chunkIdx] = result
 			}
