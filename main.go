@@ -371,8 +371,7 @@ type ViewerStack struct {
 // ============================================================================
 
 const (
-	pagingThresholdBytes = 250 * 1024 * 1024 // 250MB - use paging for files larger than this
-	pageSize             = 10000             // lines per page (10K)
+	pageSize = 10000 // lines per page (10K)
 )
 
 // LineIndex stores byte offsets for all lines without storing content
@@ -1041,6 +1040,27 @@ type App struct {
 	visualCursor       int    // Current cursor line in visual mode
 	visualCursorOffset int    // Row offset within cursor line (for wrap/json mode)
 	timestampFormat    string // Python-style datetime format for timestamp search
+	baselineMemory     uint64 // Baseline memory usage after initial load
+	memoryWarning      bool   // True if memory usage exceeds 3x baseline
+	memoryStopChan     chan struct{}
+	memoryStopOnce     sync.Once
+	actionLog          []ActionLogEntry // Log of user actions for debugging
+	actionLogMu        sync.Mutex
+	memoryLogDumped    bool // Prevent multiple dumps
+}
+
+// ActionLogEntry records a user action with context for debugging
+type ActionLogEntry struct {
+	Timestamp    time.Time
+	Action       string
+	Details      string
+	TopLine      int
+	LineCount    int
+	StackDepth   int
+	MemoryBytes  uint64
+	SearchQuery  string
+	IsPaged      bool
+	IsFiltered   bool
 }
 
 // History manages persistent command history (for filters and searches)
@@ -1422,25 +1442,17 @@ func (s *SearchState) Search(lines []string, hasANSI []bool, query string, start
 }
 
 func NewViewer(filename string) (*Viewer, error) {
+	// Always use pager mode for file-based viewers
+	return newPagedViewer(filename)
+}
+
+func NewViewerInMemory(filename string) (*Viewer, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check file size to decide if we should use paging
-	stat, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-
-	// For large files (> 250MB), use paging mode
-	if stat.Size() > pagingThresholdBytes {
-		file.Close()
-		return newPagedViewer(filename)
-	}
-
-	// Standard in-memory mode for smaller files
+	// Standard in-memory mode
 	v := &Viewer{
 		lines:    nil,
 		loading:  true,
@@ -2253,9 +2265,188 @@ func (s *ViewerStack) Reset() bool {
 // NewApp creates a new App with the given viewer
 func NewApp(viewer *Viewer) *App {
 	return &App{
-		stack:   NewViewerStack(viewer),
-		search:  &SearchState{},
-		history: NewHistory("/tmp/sieve_history"),
+		stack:          NewViewerStack(viewer),
+		search:         &SearchState{},
+		history:        NewHistory("/tmp/sieve_history"),
+		memoryStopChan: make(chan struct{}),
+	}
+}
+
+// getCurrentMemoryMB returns current memory usage in bytes
+func getCurrentMemoryBytes() uint64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Alloc
+}
+
+// StartMemoryMonitor starts background memory monitoring
+// Should be called after initial file loading is complete
+func (a *App) StartMemoryMonitor() {
+	// Capture baseline after initial load
+	a.baselineMemory = getCurrentMemoryBytes()
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-a.memoryStopChan:
+				return
+			case <-ticker.C:
+				current := getCurrentMemoryBytes()
+				threshold := a.baselineMemory * 3
+				wasWarning := a.memoryWarning
+				a.memoryWarning = current > threshold
+
+				// Trigger redraw if warning state changed
+				if a.memoryWarning != wasWarning {
+					termbox.Interrupt()
+				}
+
+				// Dump action log when memory overuse is first detected
+				if a.memoryWarning && !wasWarning {
+					a.DumpActionLog("/tmp/sieve_memory_overuse")
+				}
+			}
+		}
+	}()
+}
+
+// StopMemoryMonitor stops the background memory monitoring
+func (a *App) StopMemoryMonitor() {
+	a.memoryStopOnce.Do(func() {
+		close(a.memoryStopChan)
+	})
+}
+
+// LogAction records a user action with current state for debugging
+func (a *App) LogAction(action, details string) {
+	current := a.stack.Current()
+
+	entry := ActionLogEntry{
+		Timestamp:   time.Now(),
+		Action:      action,
+		Details:     details,
+		TopLine:     current.topLine,
+		LineCount:   current.LineCount(),
+		StackDepth:  len(a.stack.viewers),
+		MemoryBytes: getCurrentMemoryBytes(),
+		SearchQuery: a.search.query,
+		IsPaged:     current.paged,
+		IsFiltered:  current.lineBuffer != nil && current.lineBuffer.index != nil && current.lineBuffer.index.isFiltered,
+	}
+
+	a.actionLogMu.Lock()
+	a.actionLog = append(a.actionLog, entry)
+	// Keep last 1000 entries to prevent unbounded growth
+	if len(a.actionLog) > 1000 {
+		a.actionLog = a.actionLog[len(a.actionLog)-1000:]
+	}
+	a.actionLogMu.Unlock()
+}
+
+// DumpActionLog writes the action log to a file for debugging
+func (a *App) DumpActionLog(filename string) error {
+	a.actionLogMu.Lock()
+	defer a.actionLogMu.Unlock()
+
+	if a.memoryLogDumped {
+		return nil // Already dumped
+	}
+	a.memoryLogDumped = true
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Write header with context
+	fmt.Fprintf(file, "=== SIEVE MEMORY OVERUSE LOG ===\n")
+	fmt.Fprintf(file, "Dump Time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(file, "Baseline Memory: %d bytes (%.2f MB)\n", a.baselineMemory, float64(a.baselineMemory)/1024/1024)
+	fmt.Fprintf(file, "Current Memory: %d bytes (%.2f MB)\n", getCurrentMemoryBytes(), float64(getCurrentMemoryBytes())/1024/1024)
+	fmt.Fprintf(file, "Threshold (3x baseline): %d bytes (%.2f MB)\n", a.baselineMemory*3, float64(a.baselineMemory*3)/1024/1024)
+	fmt.Fprintf(file, "Total Actions Logged: %d\n", len(a.actionLog))
+	fmt.Fprintf(file, "\n=== VIEWER STACK STATE ===\n")
+	for i, v := range a.stack.viewers {
+		isFiltered := v.lineBuffer != nil && v.lineBuffer.index != nil && v.lineBuffer.index.isFiltered
+		fmt.Fprintf(file, "  [%d] file=%s lines=%d paged=%v filtered=%v topLine=%d\n",
+			i, v.filename, v.LineCount(), v.paged, isFiltered, v.topLine)
+	}
+	fmt.Fprintf(file, "\n=== ACTION LOG (chronological) ===\n")
+	fmt.Fprintf(file, "%-26s | %-20s | %-40s | %-8s | %-10s | %-5s | %-12s | %-6s | %-6s | %s\n",
+		"Timestamp", "Action", "Details", "TopLine", "LineCount", "Depth", "Memory(MB)", "Paged", "Filter", "SearchQuery")
+	fmt.Fprintf(file, "%s\n", strings.Repeat("-", 180))
+
+	for _, e := range a.actionLog {
+		memMB := float64(e.MemoryBytes) / 1024 / 1024
+		searchQ := e.SearchQuery
+		if len(searchQ) > 20 {
+			searchQ = searchQ[:17] + "..."
+		}
+		details := e.Details
+		if len(details) > 40 {
+			details = details[:37] + "..."
+		}
+		fmt.Fprintf(file, "%-26s | %-20s | %-40s | %-8d | %-10d | %-5d | %-12.2f | %-6v | %-6v | %s\n",
+			e.Timestamp.Format("2006-01-02 15:04:05.000"),
+			e.Action,
+			details,
+			e.TopLine,
+			e.LineCount,
+			e.StackDepth,
+			memMB,
+			e.IsPaged,
+			e.IsFiltered,
+			searchQ)
+	}
+
+	fmt.Fprintf(file, "\n=== END OF LOG ===\n")
+	return nil
+}
+
+// describeKey returns a human-readable description of a key event
+func (a *App) describeKey(ev termbox.Event) string {
+	if ev.Ch != 0 {
+		return fmt.Sprintf("'%c'", ev.Ch)
+	}
+	switch ev.Key {
+	case termbox.KeyArrowUp:
+		return "ArrowUp"
+	case termbox.KeyArrowDown:
+		return "ArrowDown"
+	case termbox.KeyArrowLeft:
+		return "ArrowLeft"
+	case termbox.KeyArrowRight:
+		return "ArrowRight"
+	case termbox.KeyPgup:
+		return "PgUp"
+	case termbox.KeyPgdn:
+		return "PgDn"
+	case termbox.KeyHome:
+		return "Home"
+	case termbox.KeyEnd:
+		return "End"
+	case termbox.KeyEnter:
+		return "Enter"
+	case termbox.KeyEsc:
+		return "Esc"
+	case termbox.KeySpace:
+		return "Space"
+	case termbox.KeyCtrlU:
+		return "Ctrl+U"
+	case termbox.KeyCtrlD:
+		return "Ctrl+D"
+	case termbox.KeyCtrlF:
+		return "Ctrl+F"
+	case termbox.KeyCtrlB:
+		return "Ctrl+B"
+	case termbox.KeyF1:
+		return "F1"
+	default:
+		return fmt.Sprintf("Key(%d)", ev.Key)
 	}
 }
 
@@ -2995,6 +3186,14 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
+		// Log the filter operation
+		filterType := "keep"
+		if !keep {
+			filterType = "exclude"
+		}
+		a.LogAction("FILTER", fmt.Sprintf("type=%s query=%q regex=%v ignoreCase=%v paged=%v",
+			filterType, query, isRegex, ignoreCase, current.paged))
+
 		// For paged viewers, use disk-based filtering
 		if current.paged {
 			a.handlePagedFilter(current, query, isRegex, ignoreCase, keep, currentTopLine)
@@ -3221,6 +3420,10 @@ func (a *App) HandleFilterAppend() {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers("+")
 	if ok && query != "" {
+		// Log the filter append operation
+		a.LogAction("FILTER_APPEND", fmt.Sprintf("query=%q regex=%v ignoreCase=%v",
+			query, isRegex, ignoreCase))
+
 		original := a.stack.viewers[0]
 
 		// Handle paged viewers separately
@@ -3583,6 +3786,14 @@ func (a *App) HandleSearch(backward bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
+		// Log the search operation
+		dir := "forward"
+		if backward {
+			dir = "backward"
+		}
+		a.LogAction("SEARCH", fmt.Sprintf("dir=%s query=%q regex=%v ignoreCase=%v paged=%v",
+			dir, query, isRegex, ignoreCase, current.paged))
+
 		var lineIdx int
 
 		if current.paged {
@@ -4085,7 +4296,6 @@ func (a *App) Draw() {
 		status := fmt.Sprintf(" VISUAL: Line %d/%d | Marked %d-%d ",
 			a.visualCursor+1, current.LineCount(), startLine+1, endLine+1)
 		a.drawVisualStatusBar(current, status)
-		termbox.Flush()
 	} else if a.statusMessage != "" && time.Now().Before(a.messageExpiry) {
 		current.showMessage(a.statusMessage)
 	} else {
@@ -4099,14 +4309,43 @@ func (a *App) Draw() {
 			}
 		}
 		origTotal := a.stack.viewers[0].LineCount()
-		
+
 		// Add search info if there are results
 		searchInfo := ""
 		if a.search.HasResults() {
 			searchInfo = fmt.Sprintf(" | Search: %d/%d", a.search.current+1, len(a.search.matches))
 		}
 		a.drawStatusBarWithSearch(current, len(a.stack.viewers), origLine, origTotal, searchInfo)
-		termbox.Flush()
+	}
+
+	// Draw memory warning if active (always visible regardless of mode)
+	if a.memoryWarning {
+		a.drawMemoryWarning(current)
+	}
+
+	termbox.Flush()
+}
+
+// drawMemoryWarning displays a memory overuse warning at the bottom
+func (a *App) drawMemoryWarning(v *Viewer) {
+	warningY := v.height - 2 // One line above status bar
+	if warningY < 0 {
+		return
+	}
+
+	warning := " ⚠ MEMORY OVERUSE "
+	// Draw with red background
+	for x := 0; x < v.width; x++ {
+		termbox.SetCell(x, warningY, ' ', termbox.ColorWhite|termbox.AttrBold, termbox.ColorRed)
+	}
+	startX := (v.width - len([]rune(warning))) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	for i, ch := range warning {
+		if startX+i < v.width {
+			termbox.SetCell(startX+i, warningY, ch, termbox.ColorWhite|termbox.AttrBold, termbox.ColorRed)
+		}
 	}
 }
 
@@ -4531,7 +4770,19 @@ func (v *Viewer) run() error {
 	termbox.SetOutputMode(termbox.Output256)
 
 	app := NewApp(v)
+	defer app.StopMemoryMonitor()
 	app.Draw()
+
+	// Start memory monitoring after initial load completes
+	go func() {
+		// Wait for initial loading to complete
+		for v.IsLoading() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Small delay to let memory settle
+		time.Sleep(500 * time.Millisecond)
+		app.StartMemoryMonitor()
+	}()
 
 	for {
 		current := app.stack.Current()
@@ -4539,6 +4790,10 @@ func (v *Viewer) run() error {
 		switch ev := termbox.PollEvent(); ev.Type {
 		case termbox.EventKey:
 			app.ClearMessage()
+
+			// Log the key event
+			keyDesc := app.describeKey(ev)
+			app.LogAction("KEY", keyDesc)
 
 			if ev.Ch != 0 {
 				switch ev.Ch {
