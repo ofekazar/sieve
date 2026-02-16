@@ -9,6 +9,7 @@ An in-memory, AI slop, file viewer with powerful filtering capabilities for navi
 
 - **In-Memory Filtering**: Filter logs with `&` (keep), `-` (exclude), `+` (add from original)
 - **Filter Stacking**: Chain multiple filters and navigate back through filter history
+- **Filter Toggle**: Temporarily disable filters to see the full file, then restore with one key
 - **Multi-File Merge**: Open multiple files, merge-sorted by timestamp
 - **Follow Mode**: Like `tail -f`, auto-scroll as files grow
 - **Search**: Forward (`/`) and backward (`?`) search with regex and case-insensitive options
@@ -90,6 +91,7 @@ kubectl logs pod-name | sieve
 | `+` | Add matching lines from original |
 | `=` | Reset to original file |
 | `U` | Pop last filter |
+| `C` | Toggle filters on/off (preserve stack) |
 
 ### Display
 | Key | Action |

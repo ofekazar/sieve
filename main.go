@@ -243,7 +243,7 @@ func stripANSIForJSON(s string) string {
 func pythonToJSON(s string) string {
 	// First strip ANSI escape codes
 	result := stripANSIForJSON(s)
-	
+
 	// Replace Python booleans and None
 	// Replace True/False/None that are not part of larger words
 	// This is a simple heuristic - replace when followed by comma, }, ], or whitespace
@@ -372,6 +372,7 @@ type App struct {
 	visualCursor       int    // Current cursor line in visual mode
 	visualCursorOffset int    // Row offset within cursor line (for wrap/json mode)
 	timestampFormat    string // Python-style datetime format for timestamp search
+	filtersDisabled    bool   // When true, shows base view while preserving filter stack
 }
 
 // History manages persistent command history (for filters and searches)
@@ -1317,7 +1318,7 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 // promptWithModifiers prompts for input with regex (Ctrl+R), case (Ctrl+I) toggles, and history
 // Returns: input string, isRegex flag, ignoreCase flag, ok
 func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
-	v := a.stack.Current()
+	v := a.ActiveViewer()
 	a.history.Reset()
 	input := ""
 	isRegex := false
@@ -1437,6 +1438,78 @@ func NewApp(viewer *Viewer) *App {
 	}
 }
 
+// ActiveViewer returns the viewer currently being displayed.
+// When filters are disabled, returns the base (original) viewer; otherwise returns the top of the stack.
+func (a *App) ActiveViewer() *Viewer {
+	if a.filtersDisabled {
+		return a.stack.viewers[0]
+	}
+	return a.stack.Current()
+}
+
+// ToggleFilters toggles the filter view on and off.
+// When toggled off, shows the base view while preserving the filter stack.
+// When toggled back on, restores the filtered view.
+func (a *App) ToggleFilters() {
+	if len(a.stack.viewers) <= 1 {
+		a.ShowTempMessage("No active filters to toggle")
+		return
+	}
+
+	if !a.filtersDisabled {
+		// Disabling filters: trace current filtered line back to the original file
+		filtered := a.stack.Current()
+		targetLine := filtered.topLine
+		for i := len(a.stack.viewers) - 1; i >= 1; i-- {
+			v := a.stack.viewers[i]
+			if len(v.originIndices) > 0 && targetLine < len(v.originIndices) {
+				targetLine = v.originIndices[targetLine]
+			}
+		}
+		base := a.stack.viewers[0]
+		lineCount := base.LineCount()
+		if targetLine >= lineCount {
+			base.topLine = lineCount - 1
+		} else {
+			base.topLine = targetLine
+		}
+		base.topLineOffset = 0
+	} else {
+		// Re-enabling filters: find closest line in the filtered view
+		base := a.stack.viewers[0]
+		targetLine := base.topLine
+		filtered := a.stack.Current()
+		if len(filtered.originIndices) > 0 {
+			idx := sort.Search(len(filtered.originIndices), func(i int) bool {
+				return filtered.originIndices[i] >= targetLine
+			})
+			if idx < len(filtered.originIndices) {
+				filtered.topLine = idx
+			} else {
+				filtered.topLine = len(filtered.originIndices) - 1
+			}
+		}
+		filtered.topLineOffset = 0
+	}
+
+	a.filtersDisabled = !a.filtersDisabled
+	a.search.Clear()
+	if a.filtersDisabled {
+		a.ShowTempMessage("Filters OFF (C to restore)")
+	} else {
+		a.ShowTempMessage("Filters ON")
+	}
+}
+
+// ClearDisabledFilters resets the filter stack if filters are currently disabled.
+// Called before applying a new filter so it starts fresh from the base view.
+func (a *App) ClearDisabledFilters() {
+	if a.filtersDisabled {
+		a.stack.Reset()
+		a.filtersDisabled = false
+	}
+}
+
 // ShowTempMessage displays a message for 3 seconds
 func (a *App) ShowTempMessage(msg string) {
 	a.statusMessage = msg
@@ -1464,7 +1537,7 @@ func copyToClipboard(text string) error {
 
 // EnterVisualMode starts visual line selection
 func (a *App) EnterVisualMode() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	a.visualMode = true
 	a.visualStart = current.topLine
 	a.visualStartOffset = current.topLineOffset
@@ -1483,7 +1556,7 @@ func (a *App) ExitVisualMode() {
 
 // VisualCursorDown moves cursor down in visual mode, scrolling if needed
 func (a *App) VisualCursorDown() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	lineCount := current.LineCount()
 
 	if current.wordWrap || current.jsonPretty {
@@ -1510,7 +1583,7 @@ func (a *App) VisualCursorDown() {
 
 // VisualCursorUp moves cursor up in visual mode, scrolling if needed
 func (a *App) VisualCursorUp() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 
 	if current.wordWrap || current.jsonPretty {
 		// Row-by-row movement in wrap/json mode
@@ -1549,7 +1622,7 @@ func (a *App) visualCursorScreenRow(current *Viewer) int {
 }
 
 func (a *App) visualScrollIfNeeded() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 
 	// Scroll down if cursor below visible area
 	for a.visualCursorScreenRow(current) >= current.height {
@@ -1564,7 +1637,7 @@ func (a *App) visualScrollIfNeeded() {
 
 // VisualPageDown moves cursor down by a page in visual mode
 func (a *App) VisualPageDown() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	lineCount := current.LineCount()
 
 	if current.wordWrap || current.jsonPretty {
@@ -1589,7 +1662,7 @@ func (a *App) VisualPageDown() {
 
 // VisualPageUp moves cursor up by a page in visual mode
 func (a *App) VisualPageUp() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 
 	if current.wordWrap || current.jsonPretty {
 		// Move by screen height rows
@@ -1610,7 +1683,7 @@ func (a *App) VisualPageUp() {
 
 // VisualGoToStart moves cursor to start of file in visual mode
 func (a *App) VisualGoToStart() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	a.visualCursor = 0
 	a.visualCursorOffset = 0
 	current.topLine = 0
@@ -1619,7 +1692,7 @@ func (a *App) VisualGoToStart() {
 
 // VisualGoToEnd moves cursor to end of file in visual mode
 func (a *App) VisualGoToEnd() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	lineCount := current.LineCount()
 	a.visualCursor = lineCount - 1
 	if current.wordWrap || current.jsonPretty {
@@ -1637,7 +1710,7 @@ func (a *App) YankVisualSelection() {
 		return
 	}
 
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 
 	var lines []string
 	var rowCount int
@@ -1755,7 +1828,7 @@ func pythonToGoFormat(pyFormat string) string {
 		{"%Y", "2006"},
 		{"%y", "06"},
 		{"%m", "01"},
-		{"%-d", "2"},  // day without zero padding
+		{"%-d", "2"}, // day without zero padding
 		{"%d", "02"},
 		{"%H", "15"},
 		{"%I", "03"},
@@ -1820,7 +1893,7 @@ func detectTimestampFormat(line string) string {
 func extractTimestamp(line, pyFormat string) (time.Time, bool) {
 	goFmt := pythonToGoFormat(pyFormat)
 	fmtLen := len(goFmt)
-	
+
 	for i := 0; i <= len(line)-fmtLen && i < 100; i++ {
 		substr := line[i : i+fmtLen]
 		t, err := time.Parse(goFmt, substr)
@@ -1833,7 +1906,7 @@ func extractTimestamp(line, pyFormat string) (time.Time, bool) {
 
 // HandleSetTimestampFormat prompts for Python datetime format string
 func (a *App) HandleSetTimestampFormat() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	input, ok := current.promptForInput("t (timestamp format): ")
 	if !ok {
 		return
@@ -1849,14 +1922,14 @@ func (a *App) HandleSetTimestampFormat() {
 
 // HandleTimestampSearch searches for a timestamp
 func (a *App) HandleTimestampSearch() {
-	current := a.stack.Current()
-	
+	current := a.ActiveViewer()
+
 	// Get input: 6 digits (hhmmss) or 12 digits (yymmddhhmmss)
 	input, ok := current.promptForInput("b (timestamp [yymmdd]hhmmss): ")
 	if !ok || input == "" {
 		return
 	}
-	
+
 	// Validate input
 	if len(input) != 6 && len(input) != 12 {
 		a.ShowTempMessage("Enter 6 (hhmmss) or 12 (yymmddhhmmss) digits")
@@ -1868,7 +1941,7 @@ func (a *App) HandleTimestampSearch() {
 			return
 		}
 	}
-	
+
 	// Parse target time
 	var targetTime time.Time
 	now := time.Now()
@@ -1892,7 +1965,7 @@ func (a *App) HandleTimestampSearch() {
 		}
 		targetTime = time.Date(year, time.Month(mo), d, h, mi, s, 0, time.Local)
 	}
-	
+
 	// Detect or use set format
 	format := a.timestampFormat
 	if format == "" {
@@ -1904,7 +1977,7 @@ func (a *App) HandleTimestampSearch() {
 			return
 		}
 	}
-	
+
 	// Search from current line to end
 	lines := current.GetLines()
 	for i := current.topLine; i < len(lines); i++ {
@@ -1965,6 +2038,7 @@ func (a *App) ShowHelp() {
 			{"+", "Add matching from original file"},
 			{"=", "Reset to original file"},
 			{"U", "Pop last filter (go back one level)"},
+			{"C", "Toggle filters on/off (preserve stack)"},
 		}},
 		{"Display", []helpEntry{
 			{"w", "Toggle word wrap"},
@@ -2163,6 +2237,7 @@ func createMatcher(query string, isRegex, ignoreCase bool) (func(line string, ha
 // HandleFilter filters lines based on query
 // If keep is true (&), keeps matching lines; if false (-), excludes matching lines
 func (a *App) HandleFilter(keep bool) {
+	a.ClearDisabledFilters()
 	current := a.stack.Current()
 	currentTopLine := current.topLine
 
@@ -2173,7 +2248,7 @@ func (a *App) HandleFilter(keep bool) {
 
 	query, isRegex, ignoreCase, ok := a.promptWithModifiers(prompt)
 	if ok && query != "" {
-		lines := current.GetLines()       // Get snapshot for thread-safety
+		lines := current.GetLines()          // Get snapshot for thread-safety
 		hasANSICache := current.GetHasANSI() // Get ANSI cache
 
 		matcher, err := createMatcher(query, isRegex, ignoreCase)
@@ -2287,6 +2362,7 @@ func (a *App) HandleFilter(keep bool) {
 
 // HandleFilterAppend appends matching lines from original
 func (a *App) HandleFilterAppend() {
+	a.ClearDisabledFilters()
 	current := a.stack.Current()
 	currentLine := current.GetLine(current.topLine)
 
@@ -2428,7 +2504,7 @@ func (a *App) HandleFilterAppend() {
 
 // HandleGotoLine prompts for a line number and jumps to it
 func (a *App) HandleGotoLine() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	input, ok := current.promptForInput(":")
 	if ok && input != "" {
 		lineNum, err := strconv.Atoi(input)
@@ -2451,7 +2527,7 @@ func (a *App) HandleGotoLine() {
 
 // HandleExport saves the current filtered view to a file
 func (a *App) HandleExport() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	filename, ok := current.promptForInput(";")
 	if !ok || filename == "" {
 		return
@@ -2471,14 +2547,14 @@ func (a *App) HandleExport() {
 
 // HandleStickyLeft prompts for the number of sticky left columns
 func (a *App) HandleStickyLeft() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	input, ok := current.promptForInput("K (sticky cols): ")
 	if !ok {
 		return
 	}
-	
+
 	oldK := current.stickyLeft
-	
+
 	if input == "" {
 		// Empty input disables the feature
 		// Adjust leftCol: move left by oldK amount
@@ -2495,10 +2571,10 @@ func (a *App) HandleStickyLeft() {
 		a.ShowTempMessage("Invalid number")
 		return
 	}
-	
+
 	// Adjust leftCol to keep same content visible: move by (newK - oldK)
 	current.leftCol += (num - oldK)
-	
+
 	current.stickyLeft = num
 	if num > 0 {
 		// Ensure leftCol is at least stickyLeft to avoid duplicate text
@@ -2530,7 +2606,7 @@ func (a *App) ToggleFollow() {
 // HandleSearch performs a search starting from current line
 // If backward is true, searches upward with "?" prompt; otherwise searches downward with "/" prompt
 func (a *App) HandleSearch(backward bool) {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	prompt := "/"
 	noMatchMsg := "EOF - no more matches"
 	if backward {
@@ -2559,7 +2635,7 @@ func (a *App) HandleSearchNav(reverse bool) {
 		return
 	}
 
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	topLine := current.topLine
 
 	// Determine if we should go forward (down) or backward (up) in the file
@@ -2653,12 +2729,16 @@ func (a *App) HandleStackNav(reset bool) {
 			}
 		}
 	}
+	// If the stack is now at depth 1, filters can't be disabled anymore
+	if len(a.stack.viewers) <= 1 {
+		a.filtersDisabled = false
+	}
 	a.search.Clear()
 }
 
 // Draw renders the current view
 func (a *App) Draw() {
-	current := a.stack.Current()
+	current := a.ActiveViewer()
 	current.resize(termbox.Size())
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
@@ -2685,22 +2765,30 @@ func (a *App) Draw() {
 		current.showMessage(a.statusMessage)
 	} else {
 		a.statusMessage = ""
-		// Calculate original line number by tracing through the stack
-		origLine := current.topLine
-		for i := len(a.stack.viewers) - 1; i >= 1; i-- {
-			v := a.stack.viewers[i]
-			if len(v.originIndices) > 0 && origLine < len(v.originIndices) {
-				origLine = v.originIndices[origLine]
-			}
-		}
-		origTotal := a.stack.viewers[0].LineCount()
-		
+
 		// Add search info if there are results
 		searchInfo := ""
 		if a.search.HasResults() {
 			searchInfo = fmt.Sprintf(" | Search: %d/%d", a.search.current+1, len(a.search.matches))
 		}
-		a.drawStatusBarWithSearch(current, len(a.stack.viewers), origLine, origTotal, searchInfo)
+
+		if a.filtersDisabled {
+			// Filters are paused: current is the base viewer, no origin tracing needed
+			depth := len(a.stack.viewers)
+			filterInfo := fmt.Sprintf("%s | Filters OFF [Depth %d]", searchInfo, depth)
+			a.drawStatusBarWithSearch(current, 1, current.topLine, current.LineCount(), filterInfo)
+		} else {
+			// Calculate original line number by tracing through the stack
+			origLine := current.topLine
+			for i := len(a.stack.viewers) - 1; i >= 1; i-- {
+				v := a.stack.viewers[i]
+				if len(v.originIndices) > 0 && origLine < len(v.originIndices) {
+					origLine = v.originIndices[origLine]
+				}
+			}
+			origTotal := a.stack.viewers[0].LineCount()
+			a.drawStatusBarWithSearch(current, len(a.stack.viewers), origLine, origTotal, searchInfo)
+		}
 		termbox.Flush()
 	}
 }
@@ -2820,7 +2908,6 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 					termbox.SetCell(screenX, screenY, cells[i].char, fg, bg)
 					screenX++
 				}
-
 
 				// Draw the rest of the line starting from leftCol (or after sticky if not scrolled)
 				startCol := current.leftCol
@@ -3137,7 +3224,7 @@ func (v *Viewer) run() error {
 	app.Draw()
 
 	for {
-		current := app.stack.Current()
+		current := app.ActiveViewer()
 
 		switch ev := termbox.PollEvent(); ev.Type {
 		case termbox.EventKey:
@@ -3171,8 +3258,8 @@ func (v *Viewer) run() error {
 					current.navigateRight(15)
 				case 'w':
 					current.wordWrap = !current.wordWrap
-					current.leftCol = 0         // Reset horizontal scroll when toggling wrap
-					current.topLineOffset = 0   // Reset line offset
+					current.leftCol = 0       // Reset horizontal scroll when toggling wrap
+					current.topLineOffset = 0 // Reset line offset
 				case 'g':
 					if app.visualMode {
 						app.VisualGoToStart()
@@ -3214,11 +3301,11 @@ func (v *Viewer) run() error {
 					current.navigateRight(1)
 				case '<':
 					current.navigateLeft(1)
-			case 'K':
-				app.HandleStickyLeft()
-			case 'L':
-				current.showLineNumbers = !current.showLineNumbers
-			case 'v':
+				case 'K':
+					app.HandleStickyLeft()
+				case 'L':
+					current.showLineNumbers = !current.showLineNumbers
+				case 'v':
 					if !app.visualMode {
 						app.EnterVisualMode()
 					}
@@ -3232,6 +3319,8 @@ func (v *Viewer) run() error {
 					app.HandleTimestampSearch()
 				case 'U':
 					app.HandleStackNav(false)
+				case 'C':
+					app.ToggleFilters()
 				}
 			} else {
 				switch ev.Key {
