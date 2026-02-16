@@ -3118,7 +3118,15 @@ func (v *Viewer) run() error {
 	defer fmt.Print("\033[?1049l")
 
 	if err := termbox.Init(); err != nil {
-		return err
+		// termbox-go has a hardcoded terminfo database and doesn't recognize
+		// newer terminals (e.g. Ghostty's "xterm-ghostty"). Fall back to
+		// xterm-256color which is widely compatible.
+		orig := os.Getenv("TERM")
+		os.Setenv("TERM", "xterm-256color")
+		if err2 := termbox.Init(); err2 != nil {
+			os.Setenv("TERM", orig)
+			return fmt.Errorf("%v (also tried TERM=xterm-256color: %v)", err, err2)
+		}
 	}
 	defer termbox.Close()
 
