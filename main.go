@@ -364,6 +364,8 @@ type App struct {
 	stack              *ViewerStack
 	search             *SearchState
 	history            *History // Shared history for filters and searches
+	timestampHistory   *History // History for timestamp search (b)
+	stickyLeftHistory  *History // History for sticky left columns (K)
 	statusMessage      string
 	messageExpiry      time.Time
 	visualMode         bool   // True when in visual selection mode
@@ -1267,10 +1269,12 @@ func (v *Viewer) resize(width, height int) {
 
 // promptForInput shows a prompt at the bottom line and collects user input
 func (v *Viewer) promptForInput(prompt string) (string, bool) {
-	input := ""
+	runes := []rune{}
+	cursorIdx := 0
 
 	for {
 		statusY := v.height
+		input := string(runes)
 		line := prompt + input
 
 		for i := 0; i < v.width; i++ {
@@ -1282,7 +1286,7 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 			}
 			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
 		}
-		cursorPos := len([]rune(line))
+		cursorPos := len([]rune(prompt)) + cursorIdx
 		if cursorPos < v.width {
 			termbox.SetCursor(cursorPos, statusY)
 		}
@@ -1298,14 +1302,36 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 				termbox.HideCursor()
 				return "", false
 			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
-				if len(input) > 0 {
-					runes := []rune(input)
-					input = string(runes[:len(runes)-1])
+				if cursorIdx > 0 {
+					runes = append(runes[:cursorIdx-1], runes[cursorIdx:]...)
+					cursorIdx--
 				}
+			} else if ev.Key == termbox.KeyDelete {
+				if cursorIdx < len(runes) {
+					runes = append(runes[:cursorIdx], runes[cursorIdx+1:]...)
+				}
+			} else if ev.Key == termbox.KeyArrowLeft {
+				if cursorIdx > 0 {
+					cursorIdx--
+				}
+			} else if ev.Key == termbox.KeyArrowRight {
+				if cursorIdx < len(runes) {
+					cursorIdx++
+				}
+			} else if ev.Key == termbox.KeyHome {
+				cursorIdx = 0
+			} else if ev.Key == termbox.KeyEnd {
+				cursorIdx = len(runes)
 			} else if ev.Ch != 0 {
-				input += string(ev.Ch)
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ev.Ch
+				cursorIdx++
 			} else if ev.Key == termbox.KeySpace {
-				input += " "
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ' '
+				cursorIdx++
 			}
 		case termbox.EventResize:
 			termbox.Sync()
@@ -1320,7 +1346,8 @@ func (v *Viewer) promptForInput(prompt string) (string, bool) {
 func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
 	v := a.ActiveViewer()
 	a.history.Reset()
-	input := ""
+	runes := []rune{}
+	cursorIdx := 0
 	isRegex := false
 	ignoreCase := false
 
@@ -1339,6 +1366,7 @@ func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
 		if indicators != "" {
 			indicators += " "
 		}
+		input := string(runes)
 		line := prompt + indicators + input
 
 		for i := 0; i < v.width; i++ {
@@ -1350,7 +1378,7 @@ func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
 			}
 			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
 		}
-		cursorPos := len([]rune(line))
+		cursorPos := len([]rune(prompt)) + len([]rune(indicators)) + cursorIdx
 		if cursorPos < v.width {
 			termbox.SetCursor(cursorPos, statusY)
 		}
@@ -1361,30 +1389,149 @@ func (a *App) promptWithModifiers(prompt string) (string, bool, bool, bool) {
 		case termbox.EventKey:
 			if ev.Key == termbox.KeyEnter {
 				termbox.HideCursor()
-				if input != "" {
-					a.history.AddWithModifiers(input, isRegex, ignoreCase)
+				result := string(runes)
+				if result != "" {
+					a.history.AddWithModifiers(result, isRegex, ignoreCase)
 				}
-				return input, isRegex, ignoreCase, true
+				return result, isRegex, ignoreCase, true
 			} else if ev.Key == termbox.KeyEsc {
 				termbox.HideCursor()
 				return "", false, false, false
 			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
-				if len(input) > 0 {
-					runes := []rune(input)
-					input = string(runes[:len(runes)-1])
+				if cursorIdx > 0 {
+					runes = append(runes[:cursorIdx-1], runes[cursorIdx:]...)
+					cursorIdx--
 				}
+			} else if ev.Key == termbox.KeyDelete {
+				if cursorIdx < len(runes) {
+					runes = append(runes[:cursorIdx], runes[cursorIdx+1:]...)
+				}
+			} else if ev.Key == termbox.KeyArrowLeft {
+				if cursorIdx > 0 {
+					cursorIdx--
+				}
+			} else if ev.Key == termbox.KeyArrowRight {
+				if cursorIdx < len(runes) {
+					cursorIdx++
+				}
+			} else if ev.Key == termbox.KeyHome {
+				cursorIdx = 0
+			} else if ev.Key == termbox.KeyEnd {
+				cursorIdx = len(runes)
 			} else if ev.Key == termbox.KeyArrowUp {
-				input, isRegex, ignoreCase = a.history.UpWithModifiers(input, isRegex, ignoreCase)
+				newInput, newRegex, newIgnoreCase := a.history.UpWithModifiers(string(runes), isRegex, ignoreCase)
+				runes = []rune(newInput)
+				isRegex = newRegex
+				ignoreCase = newIgnoreCase
+				cursorIdx = len(runes)
 			} else if ev.Key == termbox.KeyArrowDown {
-				input, isRegex, ignoreCase = a.history.DownWithModifiers(input, isRegex, ignoreCase)
+				newInput, newRegex, newIgnoreCase := a.history.DownWithModifiers(string(runes), isRegex, ignoreCase)
+				runes = []rune(newInput)
+				isRegex = newRegex
+				ignoreCase = newIgnoreCase
+				cursorIdx = len(runes)
 			} else if ev.Key == termbox.KeyCtrlR {
 				isRegex = !isRegex
 			} else if ev.Key == termbox.KeyCtrlI {
 				ignoreCase = !ignoreCase
 			} else if ev.Ch != 0 {
-				input += string(ev.Ch)
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ev.Ch
+				cursorIdx++
 			} else if ev.Key == termbox.KeySpace {
-				input += " "
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ' '
+				cursorIdx++
+			}
+		case termbox.EventResize:
+			termbox.Sync()
+			v.resize(ev.Width, ev.Height)
+			v.draw()
+		}
+	}
+}
+
+// promptWithHistory prompts for input with history support (up/down arrows) and cursor editing
+func (a *App) promptWithHistory(prompt string, hist *History) (string, bool) {
+	v := a.ActiveViewer()
+	hist.Reset()
+	runes := []rune{}
+	cursorIdx := 0
+
+	for {
+		statusY := v.height
+		input := string(runes)
+		line := prompt + input
+
+		for i := 0; i < v.width; i++ {
+			termbox.SetCell(i, statusY, ' ', termbox.ColorBlack, termbox.ColorWhite)
+		}
+		for i, char := range line {
+			if i >= v.width {
+				break
+			}
+			termbox.SetCell(i, statusY, char, termbox.ColorBlack, termbox.ColorWhite)
+		}
+		cursorPos := len([]rune(prompt)) + cursorIdx
+		if cursorPos < v.width {
+			termbox.SetCursor(cursorPos, statusY)
+		}
+		termbox.Flush()
+
+		ev := termbox.PollEvent()
+		switch ev.Type {
+		case termbox.EventKey:
+			if ev.Key == termbox.KeyEnter {
+				termbox.HideCursor()
+				result := string(runes)
+				if result != "" {
+					hist.Add(result)
+				}
+				return result, true
+			} else if ev.Key == termbox.KeyEsc {
+				termbox.HideCursor()
+				return "", false
+			} else if ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2 {
+				if cursorIdx > 0 {
+					runes = append(runes[:cursorIdx-1], runes[cursorIdx:]...)
+					cursorIdx--
+				}
+			} else if ev.Key == termbox.KeyDelete {
+				if cursorIdx < len(runes) {
+					runes = append(runes[:cursorIdx], runes[cursorIdx+1:]...)
+				}
+			} else if ev.Key == termbox.KeyArrowLeft {
+				if cursorIdx > 0 {
+					cursorIdx--
+				}
+			} else if ev.Key == termbox.KeyArrowRight {
+				if cursorIdx < len(runes) {
+					cursorIdx++
+				}
+			} else if ev.Key == termbox.KeyHome {
+				cursorIdx = 0
+			} else if ev.Key == termbox.KeyEnd {
+				cursorIdx = len(runes)
+			} else if ev.Key == termbox.KeyArrowUp {
+				newInput := hist.Up(string(runes))
+				runes = []rune(newInput)
+				cursorIdx = len(runes)
+			} else if ev.Key == termbox.KeyArrowDown {
+				newInput := hist.Down(string(runes))
+				runes = []rune(newInput)
+				cursorIdx = len(runes)
+			} else if ev.Ch != 0 {
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ev.Ch
+				cursorIdx++
+			} else if ev.Key == termbox.KeySpace {
+				runes = append(runes, 0)
+				copy(runes[cursorIdx+1:], runes[cursorIdx:])
+				runes[cursorIdx] = ' '
+				cursorIdx++
 			}
 		case termbox.EventResize:
 			termbox.Sync()
@@ -1432,9 +1579,11 @@ func (s *ViewerStack) Reset() bool {
 // NewApp creates a new App with the given viewer
 func NewApp(viewer *Viewer) *App {
 	return &App{
-		stack:   NewViewerStack(viewer),
-		search:  &SearchState{},
-		history: NewHistory("/tmp/sieve_history"),
+		stack:             NewViewerStack(viewer),
+		search:            &SearchState{},
+		history:           NewHistory("/tmp/sieve_history"),
+		timestampHistory:  NewHistory("/tmp/sieve_timestamp_history"),
+		stickyLeftHistory: NewHistory("/tmp/sieve_stickyleft_history"),
 	}
 }
 
@@ -1925,7 +2074,7 @@ func (a *App) HandleTimestampSearch() {
 	current := a.ActiveViewer()
 
 	// Get input: 6 digits (hhmmss) or 12 digits (yymmddhhmmss)
-	input, ok := current.promptForInput("b (timestamp [yymmdd]hhmmss): ")
+	input, ok := a.promptWithHistory("b (timestamp [yymmdd]hhmmss): ", a.timestampHistory)
 	if !ok || input == "" {
 		return
 	}
@@ -2548,7 +2697,7 @@ func (a *App) HandleExport() {
 // HandleStickyLeft prompts for the number of sticky left columns
 func (a *App) HandleStickyLeft() {
 	current := a.ActiveViewer()
-	input, ok := current.promptForInput("K (sticky cols): ")
+	input, ok := a.promptWithHistory("K (sticky cols): ", a.stickyLeftHistory)
 	if !ok {
 		return
 	}
