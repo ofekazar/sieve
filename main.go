@@ -40,9 +40,15 @@ func parseANSI(line string) []ansiCell {
 
 	if !hasEscape {
 		runes := []rune(line)
-		cells := make([]ansiCell, len(runes))
-		for i, r := range runes {
-			cells[i] = ansiCell{r, termbox.ColorDefault, termbox.ColorDefault}
+		cells := make([]ansiCell, 0, len(runes))
+		for _, r := range runes {
+			if r == '\t' {
+				for s := 0; s < tabSize; s++ {
+					cells = append(cells, ansiCell{' ', termbox.ColorDefault, termbox.ColorDefault})
+				}
+			} else {
+				cells = append(cells, ansiCell{r, termbox.ColorDefault, termbox.ColorDefault})
+			}
 		}
 		return cells
 	}
@@ -70,7 +76,13 @@ func parseANSI(line string) []ansiCell {
 				continue
 			}
 		}
-		cells = append(cells, ansiCell{runes[i], fg, bg})
+		if runes[i] == '\t' {
+			for s := 0; s < tabSize; s++ {
+				cells = append(cells, ansiCell{' ', fg, bg})
+			}
+		} else {
+			cells = append(cells, ansiCell{runes[i], fg, bg})
+		}
 		i++
 	}
 	return cells
@@ -3442,12 +3454,15 @@ func NewViewerFromMultipleFiles(filenames []string) (*Viewer, error) {
 	return v, nil
 }
 
+var tabSize = 4
+
 const version = "1.0.0"
 
 func main() {
 	// Parse command line flags
 	followFlag := flag.Bool("f", false, "Follow mode (like tail -f)")
 	followLongFlag := flag.Bool("follow", false, "Follow mode (like tail -f)")
+	tabSizeFlag := flag.Int("t", 4, "Tab size in spaces")
 	lineNumFlag := flag.Bool("l", false, "Show line numbers")
 	helpFlag := flag.Bool("h", false, "Show help")
 	helpLongFlag := flag.Bool("help", false, "Show help")
@@ -3459,6 +3474,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       command | sieve\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  -f, --follow    Follow mode (like tail -f)\n")
+		fmt.Fprintf(os.Stderr, "  -t <size>       Tab size in spaces (default: 4)\n")
 		fmt.Fprintf(os.Stderr, "  -l              Show line numbers\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help      Show this help message\n")
 		fmt.Fprintf(os.Stderr, "      --version   Show version\n\n")
@@ -3477,6 +3493,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	tabSize = *tabSizeFlag
 	follow := *followFlag || *followLongFlag
 	args := flag.Args()
 
