@@ -1602,7 +1602,7 @@ func (a *App) ActiveViewer() *Viewer {
 // When toggled back on, restores the filtered view.
 func (a *App) ToggleFilters() {
 	if len(a.stack.viewers) <= 1 {
-		a.ShowTempMessage("No active filters to toggle")
+		a.ShowTempMessage("No active filters to toggle", 500*time.Millisecond)
 		return
 	}
 
@@ -1652,9 +1652,9 @@ func (a *App) ToggleFilters() {
 
 	a.search.Clear()
 	if a.filtersDisabled {
-		a.ShowTempMessage("Filters OFF (C to restore)")
+		a.ShowTempMessage("Filters OFF (C to restore)", 500*time.Millisecond)
 	} else {
-		a.ShowTempMessage("Filters ON")
+		a.ShowTempMessage("Filters ON", 500*time.Millisecond)
 	}
 }
 
@@ -1667,12 +1667,15 @@ func (a *App) ClearDisabledFilters() {
 	}
 }
 
-// ShowTempMessage displays a message for 3 seconds
-func (a *App) ShowTempMessage(msg string) {
+func (a *App) ShowTempMessage(msg string, duration ...time.Duration) {
+	d := 1500 * time.Millisecond
+	if len(duration) > 0 {
+		d = duration[0]
+	}
 	a.statusMessage = msg
-	a.messageExpiry = time.Now().Add(3 * time.Second)
+	a.messageExpiry = time.Now().Add(d)
 	go func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(d)
 		termbox.Interrupt()
 	}()
 }
