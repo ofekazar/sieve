@@ -1625,20 +1625,23 @@ func (a *App) ToggleFilters() {
 		}
 		base.topLineOffset = 0
 	} else {
-		// Re-enabling filters: find closest line in the filtered view
-		base := a.stack.viewers[0]
-		targetLine := base.topLine
-		filtered := a.stack.Current()
-		if len(filtered.originIndices) > 0 {
-			idx := sort.Search(len(filtered.originIndices), func(i int) bool {
-				return filtered.originIndices[i] >= targetLine
-			})
-			if idx < len(filtered.originIndices) {
-				filtered.topLine = idx
-			} else {
-				filtered.topLine = len(filtered.originIndices) - 1
+		// Re-enabling filters: trace base position down through each stack level
+		targetLine := a.stack.viewers[0].topLine
+		for i := 1; i < len(a.stack.viewers); i++ {
+			v := a.stack.viewers[i]
+			if len(v.originIndices) > 0 {
+				idx := sort.Search(len(v.originIndices), func(j int) bool {
+					return v.originIndices[j] >= targetLine
+				})
+				if idx < len(v.originIndices) {
+					targetLine = idx
+				} else {
+					targetLine = len(v.originIndices) - 1
+				}
 			}
 		}
+		filtered := a.stack.Current()
+		filtered.topLine = targetLine
 		filtered.topLineOffset = 0
 	}
 
