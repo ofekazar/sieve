@@ -375,6 +375,7 @@ type App struct {
 	visualCursorOffset int    // Row offset within cursor line (for wrap/json mode)
 	timestampFormat    string // Python-style datetime format for timestamp search
 	filtersDisabled    bool   // When true, shows base view while preserving filter stack
+	stickyLeft         int    // Global sticky left columns, persists across filter stack changes
 }
 
 // History manages persistent command history (for filters and searches)
@@ -1642,6 +1643,13 @@ func (a *App) ToggleFilters() {
 	}
 
 	a.filtersDisabled = !a.filtersDisabled
+
+	active := a.ActiveViewer()
+	active.stickyLeft = a.stickyLeft
+	if a.stickyLeft > 0 && active.leftCol < a.stickyLeft {
+		active.leftCol = a.stickyLeft
+	}
+
 	a.search.Clear()
 	if a.filtersDisabled {
 		a.ShowTempMessage("Filters OFF (C to restore)")
@@ -2406,13 +2414,13 @@ func (a *App) HandleFilter(keep bool) {
 			return
 		}
 
-		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
-			lines:    nil,
-			loading:  true,
-			filename: current.filename,
-			topLine:  0,
-			leftCol:  0,
+			lines:      nil,
+			loading:    true,
+			filename:   current.filename,
+			topLine:    0,
+			leftCol:    a.stickyLeft,
+			stickyLeft: a.stickyLeft,
 		}
 		a.stack.Push(newViewer)
 		a.search.Clear()
@@ -2528,13 +2536,13 @@ func (a *App) HandleFilterAppend() {
 			return
 		}
 
-		// Create new viewer immediately with loading state
 		newViewer := &Viewer{
-			lines:    nil,
-			loading:  true,
-			filename: current.filename,
-			topLine:  0,
-			leftCol:  0,
+			lines:      nil,
+			loading:    true,
+			filename:   current.filename,
+			topLine:    0,
+			leftCol:    a.stickyLeft,
+			stickyLeft: a.stickyLeft,
 		}
 		a.stack.Push(newViewer)
 		a.search.Clear()
@@ -2702,15 +2710,14 @@ func (a *App) HandleStickyLeft() {
 		return
 	}
 
-	oldK := current.stickyLeft
+	oldK := a.stickyLeft
 
 	if input == "" {
-		// Empty input disables the feature
-		// Adjust leftCol: move left by oldK amount
 		current.leftCol -= oldK
 		if current.leftCol < 0 {
 			current.leftCol = 0
 		}
+		a.stickyLeft = 0
 		current.stickyLeft = 0
 		a.ShowTempMessage("Sticky left disabled")
 		return
@@ -2721,12 +2728,11 @@ func (a *App) HandleStickyLeft() {
 		return
 	}
 
-	// Adjust leftCol to keep same content visible: move by (newK - oldK)
 	current.leftCol += (num - oldK)
 
+	a.stickyLeft = num
 	current.stickyLeft = num
 	if num > 0 {
-		// Ensure leftCol is at least stickyLeft to avoid duplicate text
 		if current.leftCol < num {
 			current.leftCol = num
 		}
@@ -2856,6 +2862,10 @@ func (a *App) HandleStackNav(reset bool) {
 	if changed {
 		newCurrent := a.stack.Current()
 		newCurrent.topLineOffset = 0
+		newCurrent.stickyLeft = a.stickyLeft
+		if a.stickyLeft > 0 && newCurrent.leftCol < a.stickyLeft {
+			newCurrent.leftCol = a.stickyLeft
+		}
 
 		// If newCurrent has originIndices, find closest line using binary search
 		if len(newCurrent.originIndices) > 0 {
