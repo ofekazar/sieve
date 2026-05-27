@@ -1642,13 +1642,13 @@ func (a *App) ToggleFilters() {
 		filtered.topLineOffset = 0
 	}
 
+	savedLeftCol := a.ActiveViewer().leftCol
+
 	a.filtersDisabled = !a.filtersDisabled
 
 	active := a.ActiveViewer()
 	active.stickyLeft = a.stickyLeft
-	if a.stickyLeft > 0 && active.leftCol < a.stickyLeft {
-		active.leftCol = a.stickyLeft
-	}
+	active.leftCol = savedLeftCol
 
 	a.search.Clear()
 	if a.filtersDisabled {
@@ -2419,7 +2419,7 @@ func (a *App) HandleFilter(keep bool) {
 			loading:    true,
 			filename:   current.filename,
 			topLine:    0,
-			leftCol:    a.stickyLeft,
+			leftCol:    current.leftCol,
 			stickyLeft: a.stickyLeft,
 		}
 		a.stack.Push(newViewer)
@@ -2541,7 +2541,7 @@ func (a *App) HandleFilterAppend() {
 			loading:    true,
 			filename:   current.filename,
 			topLine:    0,
-			leftCol:    a.stickyLeft,
+			leftCol:    current.leftCol,
 			stickyLeft: a.stickyLeft,
 		}
 		a.stack.Push(newViewer)
@@ -2832,6 +2832,7 @@ func (a *App) HandleSearchNav(reverse bool) {
 func (a *App) HandleStackNav(reset bool) {
 	current := a.stack.Current()
 	topLine := current.topLine
+	savedLeftCol := current.leftCol
 
 	// Get the target line index in the parent/original viewer
 	var targetLine int
@@ -2863,9 +2864,7 @@ func (a *App) HandleStackNav(reset bool) {
 		newCurrent := a.stack.Current()
 		newCurrent.topLineOffset = 0
 		newCurrent.stickyLeft = a.stickyLeft
-		if a.stickyLeft > 0 && newCurrent.leftCol < a.stickyLeft {
-			newCurrent.leftCol = a.stickyLeft
-		}
+		newCurrent.leftCol = savedLeftCol
 
 		// If newCurrent has originIndices, find closest line using binary search
 		if len(newCurrent.originIndices) > 0 {
