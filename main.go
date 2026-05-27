@@ -2198,7 +2198,7 @@ func (a *App) ShowHelp() {
 			{"C", "Toggle filters on/off (preserve stack)"},
 		}},
 		{"Display", []helpEntry{
-			{"w", "Toggle word wrap"},
+			{"w / W", "Toggle word wrap"},
 			{"f", "Toggle JSON pretty-print"},
 			{"F", "Toggle follow mode (tail -f)"},
 			{"K", "Set sticky left columns"},
@@ -3414,7 +3414,7 @@ func (v *Viewer) run() error {
 					current.navigateLeft(15)
 				case 'l':
 					current.navigateRight(15)
-				case 'w':
+				case 'w', 'W':
 					current.wordWrap = !current.wordWrap
 					current.leftCol = 0       // Reset horizontal scroll when toggling wrap
 					current.topLineOffset = 0 // Reset line offset
