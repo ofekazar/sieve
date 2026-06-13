@@ -27,6 +27,23 @@ type ansiCell struct {
 	bg   termbox.Attribute
 }
 
+// tabWidth is the number of columns between tab stops. Tabs are expanded to
+// spaces during parsing so a raw \t never reaches termbox.SetCell (a stray tab
+// byte desyncs termbox's cursor model from the terminal and garbles the layout,
+// e.g. under ConPTY-based terminals like Alacritty).
+const tabWidth = 4
+
+// expandTab appends spaces to cells to advance to the next tab stop, using the
+// current visible column (len(cells)) so tab stops are correct and escape
+// sequences are ignored.
+func expandTab(cells []ansiCell, fg, bg termbox.Attribute) []ansiCell {
+	spaces := tabWidth - (len(cells) % tabWidth)
+	for s := 0; s < spaces; s++ {
+		cells = append(cells, ansiCell{' ', fg, bg})
+	}
+	return cells
+}
+
 // parseANSI parses a line with ANSI escape codes and returns cells with colors
 func parseANSI(line string) []ansiCell {
 	// Fast path: check for escape character using byte scan (faster than strings.Contains)
@@ -40,9 +57,13 @@ func parseANSI(line string) []ansiCell {
 
 	if !hasEscape {
 		runes := []rune(line)
-		cells := make([]ansiCell, len(runes))
-		for i, r := range runes {
-			cells[i] = ansiCell{r, termbox.ColorDefault, termbox.ColorDefault}
+		cells := make([]ansiCell, 0, len(runes))
+		for _, r := range runes {
+			if r == '\t' {
+				cells = expandTab(cells, termbox.ColorDefault, termbox.ColorDefault)
+				continue
+			}
+			cells = append(cells, ansiCell{r, termbox.ColorDefault, termbox.ColorDefault})
 		}
 		return cells
 	}
@@ -69,6 +90,11 @@ func parseANSI(line string) []ansiCell {
 				i = end + 1
 				continue
 			}
+		}
+		if runes[i] == '\t' {
+			cells = expandTab(cells, fg, bg)
+			i++
+			continue
 		}
 		cells = append(cells, ansiCell{runes[i], fg, bg})
 		i++
@@ -957,6 +983,14 @@ func (v *Viewer) draw() {
 				break
 			}
 
+			if char == '\t' {
+				spaces := tabWidth - (screenX % tabWidth)
+				for s := 0; s < spaces && screenX < v.width; s++ {
+					termbox.SetCell(screenX, screenY, ' ', termbox.ColorDefault, termbox.ColorDefault)
+					screenX++
+				}
+				continue
+			}
 			termbox.SetCell(screenX, screenY, char, termbox.ColorDefault, termbox.ColorDefault)
 			screenX++
 		}
