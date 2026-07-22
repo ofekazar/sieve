@@ -134,15 +134,33 @@ func applyANSICodes(seq string, fg, bg termbox.Attribute) (termbox.Attribute, te
 	return fg, bg
 }
 
-// findJSONStart finds the start index of embedded JSON in a line
-// Returns -1 if no JSON found
-func findJSONStart(line string) int {
+// findJSONRegion scans the line for the first bracket-delimited region that
+// parses as JSON, either directly or after converting Python dict/repr syntax.
+// It returns the start and end (inclusive) indices, the pretty-printed JSON, and
+// whether a valid region was found. Brackets that don't parse (e.g. log
+// timestamp prefixes like "[10:24 AM]") are skipped.
+func findJSONRegion(line string) (start int, end int, formatted string, ok bool) {
 	for i := 0; i < len(line); i++ {
-		if line[i] == '{' || line[i] == '[' {
-			return i
+		if line[i] != '{' && line[i] != '[' {
+			continue
+		}
+		e := findJSONEnd(line, i)
+		if e == -1 {
+			continue
+		}
+		jsonPart := line[i : e+1]
+
+		var out bytes.Buffer
+		if err := json.Indent(&out, []byte(jsonPart), "", "  "); err == nil {
+			return i, e, out.String(), true
+		}
+
+		out.Reset()
+		if err := json.Indent(&out, []byte(pythonToJSON(jsonPart)), "", "  "); err == nil {
+			return i, e, out.String(), true
 		}
 	}
-	return -1
+	return -1, -1, "", false
 }
 
 // findJSONEnd finds the matching closing brace/bracket starting from jsonStart
@@ -239,6 +257,19 @@ func stripANSIForJSON(s string) string {
 	return stripANSI(s)
 }
 
+// pyReprRe matches Python repr constructor calls without nested parentheses,
+// e.g. datetime.datetime(2026, 6, 8, tzinfo=datetime.timezone.utc) or UUID('x').
+var pyReprRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\([^()]*\)`)
+
+// quotePythonReprs wraps Python object reprs (constructor-style calls) in double
+// quotes so they become valid JSON string values. Must run after single quotes
+// have already been converted to double quotes.
+func quotePythonReprs(s string) string {
+	return pyReprRe.ReplaceAllStringFunc(s, func(m string) string {
+		return `"` + strings.ReplaceAll(m, `"`, `\"`) + `"`
+	})
+}
+
 // pythonToJSON converts Python dict syntax to JSON
 func pythonToJSON(s string) string {
 	// First strip ANSI escape codes
@@ -266,45 +297,26 @@ func pythonToJSON(s string) string {
 	}
 	// Replace single quotes with double quotes (simple approach)
 	result = strings.ReplaceAll(result, "'", "\"")
+	// Wrap Python object reprs (e.g. datetime.datetime(...)) as JSON strings
+	result = quotePythonReprs(result)
 	return result
 }
 
-// formatJSON attempts to pretty-print JSON/Python dict in a line
+// formatJSON attempts to pretty-print JSON/Python dict in a line.
+// Returns []string{line} unchanged if no formattable JSON region is found.
 func formatJSON(line string) []string {
-	jsonStart := findJSONStart(line)
-	if jsonStart == -1 {
+	start, end, formatted, ok := findJSONRegion(line)
+	if !ok {
 		return []string{line}
 	}
 
-	jsonEnd := findJSONEnd(line, jsonStart)
-	if jsonEnd == -1 {
-		// No matching close, try the whole rest of line
-		jsonEnd = len(line) - 1
-	}
-
-	prefix := line[:jsonStart]
-	jsonPart := line[jsonStart : jsonEnd+1]
+	prefix := line[:start]
 	suffix := ""
-	if jsonEnd+1 < len(line) {
-		suffix = line[jsonEnd+1:]
-	}
-
-	// Try as-is first (valid JSON)
-	var out bytes.Buffer
-	err := json.Indent(&out, []byte(jsonPart), "", "  ")
-	if err != nil {
-		// Try converting from Python dict syntax
-		converted := pythonToJSON(jsonPart)
-		out.Reset()
-		err = json.Indent(&out, []byte(converted), "", "  ")
-		if err != nil {
-			// Still not valid, return original
-			return []string{line}
-		}
+	if end+1 < len(line) {
+		suffix = line[end+1:]
 	}
 
 	// Build result: prefix on first line, then indented JSON, then suffix
-	formatted := out.String()
 	jsonLines := strings.Split(formatted, "\n")
 
 	result := make([]string, 0, len(jsonLines)+1)
@@ -320,17 +332,6 @@ func formatJSON(line string) []string {
 	}
 
 	return result
-}
-
-// isJSON checks if a line contains JSON
-func isJSON(line string) bool {
-	jsonStart := findJSONStart(line)
-	if jsonStart == -1 {
-		return false
-	}
-	// Check if we can find a matching closing bracket
-	jsonEnd := findJSONEnd(line, jsonStart)
-	return jsonEnd != -1
 }
 
 type Viewer struct {
@@ -1125,7 +1126,7 @@ func (v *Viewer) getExpandedLineCount(lineIdx int) int {
 
 	// Get expanded lines (JSON or original)
 	var lines []string
-	if v.jsonPretty && isJSON(line) {
+	if v.jsonPretty {
 		lines = formatJSON(line)
 	} else {
 		lines = []string{line}
@@ -1902,7 +1903,7 @@ func (a *App) YankVisualSelection() {
 
 			// Expand the line (JSON or wrap)
 			var expandedRows []string
-			if current.jsonPretty && isJSON(line) {
+			if current.jsonPretty {
 				expandedRows = formatJSON(line)
 			} else {
 				expandedRows = []string{line}
@@ -3010,7 +3011,7 @@ func (a *App) drawNormal(current *Viewer, lineCount int) {
 
 		// Expand JSON if enabled
 		var linesToRender []string
-		if current.jsonPretty && isJSON(line) {
+		if current.jsonPretty {
 			linesToRender = formatJSON(line)
 		} else {
 			linesToRender = []string{line}
@@ -3165,7 +3166,7 @@ func (a *App) drawWrapped(current *Viewer, lineCount int) {
 
 		// Expand JSON if enabled
 		var linesToRender []string
-		if current.jsonPretty && isJSON(line) {
+		if current.jsonPretty {
 			linesToRender = formatJSON(line)
 		} else {
 			linesToRender = []string{line}
